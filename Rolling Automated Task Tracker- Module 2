@@ -5,7 +5,7 @@ Sub MoveRowsToDoneSheet()
     Dim lastRow As Long
     Dim i As Long
     Dim doneValue As String
-    Dim printValue As String
+    Dim printValue As Date
     
     Dim targetDoneRow As Long ' Variable to store the target row number in the Done sheet
     
@@ -23,9 +23,9 @@ Sub MoveRowsToDoneSheet()
     
     printValue = wsSource.Range("B1").Value
     
-    Application.ScreenUpdating = False 
+    Application.ScreenUpdating = False
     
-    For i = lastRow To 2 Step -1 
+    For i = lastRow To 2 Step -1
         doneValue = wsSource.Cells(i, SOURCE_CRITERIA_COL).Value
         
         If doneValue = "Done" Then
@@ -41,6 +41,8 @@ Sub MoveRowsToDoneSheet()
             
             ' 2. Place the printValue in column M (13) of the newly copied row
             wsDone.Cells(targetDoneRow, DONE_PRINT_VALUE_COL).Value = printValue
+            wsDone.Cells(targetDoneRow, DONE_PRINT_VALUE_COL).NumberFormat = wsSource.Range("B1").NumberFormat
+
             
             ' 3. NEW: Copy formula from column L of the row above to column L of the new row
             If targetDoneRow > 1 Then ' Check if there is a row above
