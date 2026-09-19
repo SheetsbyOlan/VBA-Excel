@@ -1,0 +1,1622 @@
+Option Explicit
+
+'====================== CONFIGURATION ======================
+' Edit these values if your sheet names or column headers differ.
+
+Public Const TASK_LIST_SHEET As String = "Task List"
+Public Const DONE_SHEET As String = "Done"
+Public Const PARKED_SHEET As String = "Parked"
+Public Const RECURRING_SHEET As String = "Recurring"
+Public Const TASK_BUNDLES_SHEET As String = "Task Bundles"
+
+' Row that column headers live on - Task List alone uses row 2; every other tab uses row 1.
+Public Const TASK_LIST_HEADER_ROW As Long = 2
+Public Const OTHER_SHEETS_HEADER_ROW As Long = 1
+
+Public Const STATUS_DONE As String = "Done"
+Public Const STATUS_PARKED As String = "Parked"
+Public Const STATUS_READY As String = "Ready"
+Public Const STATUS_PENDING As String = "Pending"
+
+Public Const COL_TASK_NAME As String = "Task List"
+Public Const COL_PROGRESS As String = "Progress/Status"
+Public Const COL_TASK_ADDED As String = "Task Added"
+Public Const COL_TASK_STARTED As String = "Task Started"
+Public Const COL_TASK_COMPLETED As String = "Task Completed"
+Public Const COL_PRIORITY As String = "Priority"
+Public Const COL_DEADLINE As String = "Deadline"
+Public Const COL_LINK As String = "Link"
+Public Const COL_TYPE As String = "Type"
+Public Const COL_TASK_FOCUS As String = "Task Focus"
+
+Public Const COL_TYPE_OPTIONS As String = "Type Options"
+Public Const COL_PRIORITY_OPTIONS As String = "Priority Options"
+Public Const COL_PROGRESS_OPTIONS As String = "Progress Options"
+Public Const COL_FOCUS_OPTIONS As String = "Focus Options"
+
+Public Const COL_REC_POSITION As String = "Position"
+Public Const COL_REC_DAY As String = "Day"
+Public Const COL_REC_PERIOD As String = "Period"
+Public Const COL_REC_LAST_ADDED As String = "Last Added"
+Public Const COL_REC_NEXT_ADD As String = "Next Add Date"
+Public Const COL_DAYS_TO_COMPLETE As String = "Days to Complete"
+
+Public Const COL_BUNDLE_PROJECT As String = "Project"
+Public Const COL_BUNDLE_PROJECT_OPTIONS As String = "Project Options"
+
+' While today is before this date, no recurring tasks fire. A real column header on Recurring,
+' found by name like Position/Day/Period - not a fixed cell, so it's safe to move.
+Public Const COL_REC_RESUME_DATE As String = "Resume Date"
+
+' Done-only column (no Task List equivalent) showing the start of the reporting week each task
+' was completed in. Computed per row from that row's own Task Completed date - see
+' StampWeeklyStartDateOnDone.
+Public Const COL_DONE_START_WEEK As String = "Start Week"
+
+' Label above a day-name dropdown on Recurring (Sunday...Saturday) that sets which day your
+' reporting week starts on. Found by searching for this text, not a fixed cell, so it keeps
+' working no matter where you place the label or how many columns you add around it.
+Public Const WEEK_START_DAY_LABEL_TEXT As String = "Beginning of Week"
+
+' Label on Task List next to the cell that's kept updated to the current reporting week's start
+' date - see RefreshTaskListStartDate, which runs whenever the file opens.
+Public Const START_DATE_LABEL_TEXT As String = "Start Date:"
+
+' Done-only column (no Task List equivalent), set by a formula comparing Deadline to Task
+' Completed - see StampMetDeadlineFormula.
+Public Const COL_DONE_MET_DEADLINE As String = "Met Deadline?"
+
+' Task Bundles picker on Task List - a dropdown cell with this label next to it, used instead of
+' a popup form since Mac Excel doesn't support those. Must stay on row 1: Task List's real column
+' headers are on row 2, and anything placed there gets misread as one.
+Public Const BUNDLE_PICKER_HEADER_TEXT As String = "Select Project"
+Public Const BUNDLE_PICKER_HEADER_ROW As Long = 1
+
+Public Const PERIOD_DAY As String = "Day"
+Public Const PERIOD_WEEK As String = "Week"
+Public Const PERIOD_MONTH As String = "Month"
+Public Const PERIOD_QUARTER As String = "Quarter"
+Public Const PERIOD_YEAR As String = "Year"
+
+'====================== STATUS FEEDBACK ======================
+' A quick status-bar message (bottom-left of the Excel window) - the closest thing to a popup
+' notification available cross-platform, since Mac Excel doesn't support the UserForms a true
+' popup would need. Clears itself automatically after a few seconds.
+Public Sub ShowStatus(ByVal message As String)
+    Application.StatusBar = message
+    On Error Resume Next
+    Application.OnTime Now + TimeSerial(0, 0, 4), "modTaskTracker.ClearStatus"
+    On Error GoTo 0
+End Sub
+
+' Resets the status bar. Must stay Public with no arguments - Application.OnTime calls it by name.
+Public Sub ClearStatus()
+    Application.StatusBar = False
+End Sub
+
+' Which row a sheet's column headers live on - row 2 for Task List, row 1 for everything else.
+Public Function HeaderRowFor(ByVal sheetName As String) As Long
+    If sheetName = TASK_LIST_SHEET Then
+        HeaderRowFor = TASK_LIST_HEADER_ROW
+    Else
+        HeaderRowFor = OTHER_SHEETS_HEADER_ROW
+    End If
+End Function
+
+' Where a given Progress value routes the row to - keyed by normalized text so a customer
+' typing "done" or "Done " still matches, same as header matching does elsewhere.
+Public Function GetStatusRoute(ByVal value As Variant) As String
+    Select Case NormalizeHeader(value)
+        Case NormalizeHeader(STATUS_DONE): GetStatusRoute = DONE_SHEET
+        Case NormalizeHeader(STATUS_PARKED): GetStatusRoute = PARKED_SHEET
+        Case NormalizeHeader(STATUS_READY): GetStatusRoute = TASK_LIST_SHEET
+        Case Else: GetStatusRoute = ""
+    End Select
+End Function
+
+'====================== COLUMN LOOKUP ======================
+' Reads the header row once and maps header text -> column number, so reordering or
+' inserting columns doesn't break the automation.
+
+' Trims whitespace and lowercases, so "To Add"/" To Add "/"TO ADD" all match the same column.
+Public Function NormalizeHeader(ByVal text As Variant) As String
+    NormalizeHeader = LCase$(Trim$(CStr(text)))
+End Function
+
+' Last column with real content in a given row. Uses UsedRange bounds rather than
+' End(xlToLeft)/End(xlToRight) - those mirror Ctrl+Left/Right and skip clean over a hidden or
+' collapsed column as if it weren't there, so a sheet's true last header could go missing from
+' every lookup just because a customer hid or grouped a column.
+Public Function LastColInRow(ByVal ws As Worksheet, ByVal rowNum As Long) As Long
+    Dim rightBound As Long
+    rightBound = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+    Dim c As Long, v As Variant
+    For c = rightBound To 1 Step -1
+        v = ws.Cells(rowNum, c).value
+        If Not IsError(v) Then
+            If Trim$(CStr(v)) <> "" Then
+                LastColInRow = c
+                Exit Function
+            End If
+        End If
+    Next c
+    LastColInRow = 0
+End Function
+
+' Maps each header's text to its column number for one sheet's header row. First occurrence wins
+' if a header appears twice.
+Public Function GetColumnMap(ByVal ws As Worksheet, ByVal headerRow As Long) As Object
+    Dim map As Object
+    Set map = New clsStringMap
+    Dim lastCol As Long
+    lastCol = LastColInRow(ws, headerRow)
+    Dim c As Long, key As String
+    For c = 1 To lastCol
+        key = NormalizeHeader(ws.Cells(headerRow, c).value)
+        If key <> "" Then
+            If Not map.Exists(key) Then map.Add key, c
+        End If
+    Next c
+    Set GetColumnMap = map
+End Function
+
+' Column number for a header name, or 0 if it isn't on the sheet.
+Public Function GetCol(ByVal colMap As Object, ByVal name As String) As Long
+    Dim key As String
+    key = NormalizeHeader(name)
+    If colMap.Exists(key) Then
+        GetCol = colMap.Item(key)
+    Else
+        GetCol = 0
+    End If
+End Function
+
+' Confirms every required header was found; shows an alert listing what's missing if not.
+Public Function RequireColumns(ByVal colMap As Object, ByVal requiredNames As Variant, ByVal sheetLabel As String, ByVal headerRow As Long) As Boolean
+    Dim missing As String
+    Dim i As Long
+    For i = LBound(requiredNames) To UBound(requiredNames)
+        If GetCol(colMap, CStr(requiredNames(i))) = 0 Then
+            missing = missing & "- """ & requiredNames(i) & """" & vbCrLf
+        End If
+    Next i
+    If missing = "" Then
+        RequireColumns = True
+    Else
+        MsgBox "Couldn't find these column headers on """ & sheetLabel & """ row " & headerRow & ":" & vbCrLf & missing & vbCrLf & "Check for typos, extra spaces, or a different header row, then try again.", vbExclamation
+        RequireColumns = False
+    End If
+End Function
+
+' Last row with any content anywhere on the sheet. Falls back to headerRow if the sheet is empty.
+Public Function LastDataRow(ByVal ws As Worksheet, ByVal headerRow As Long) As Long
+    Dim c As Range
+    Set c = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, SearchOrder:=xlByRows, SearchDirection:=xlPrevious)
+    If c Is Nothing Then
+        LastDataRow = headerRow
+    ElseIf c.row < headerRow Then
+        LastDataRow = headerRow
+    Else
+        LastDataRow = c.row
+    End If
+End Function
+
+' First blank row below a sheet's real data - where a new task gets added. Based on the last row
+' with a real task name, not "any column has any content," so a stray value left in some other
+' column can't push new tasks further down than they should be.
+Public Function TargetAppendRow(ByVal ws As Worksheet) As Long
+    Dim headerRow As Long: headerRow = HeaderRowFor(ws.name)
+    Dim cols As Object: Set cols = GetColumnMap(ws, headerRow)
+    Dim taskNameCol As Long: taskNameCol = GetCol(cols, COL_TASK_NAME)
+
+    Dim lastRow As Long
+    If taskNameCol > 0 Then
+        lastRow = ws.Cells(ws.Rows.Count, taskNameCol).End(xlUp).row
+        If lastRow < headerRow Then lastRow = headerRow
+    Else
+        lastRow = LastDataRow(ws, headerRow) ' fallback - shouldn't happen, Task List is required
+    End If
+    TargetAppendRow = lastRow + 1
+End Function
+
+' Column number -> letter(s), e.g. 28 -> "AB". Used for building formula text.
+Public Function ColumnLetter(ByVal colNum As Long) As String
+    Dim addr As String
+    addr = Cells(1, colNum).Address(False, False) ' e.g. "V1"
+    Do While Len(addr) > 0 And IsNumeric(Right$(addr, 1))
+        addr = Left$(addr, Len(addr) - 1)
+    Loop
+    ColumnLetter = addr
+End Function
+
+'====================== TAB SYNC ======================
+' Parked and Done receive whole rows copied straight from Task List, so their columns need to
+' match Task List's exactly. This keeps them in sync automatically - add, rename, or reorder a
+' column on Task List and it propagates to both.
+
+Private Function MirrorSheetNames() As Variant
+    MirrorSheetNames = Array(PARKED_SHEET, DONE_SHEET)
+End Function
+
+' Wired to the "Sync Columns Across Tabs" button. Makes Parked and Done match Task List's columns.
+Public Sub SyncColumnHeaders()
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim sourceSheet As Worksheet
+    On Error Resume Next
+    Set sourceSheet = wb.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If sourceSheet Is Nothing Then
+        MsgBox "Couldn't find a tab named """ & TASK_LIST_SHEET & """.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim lastCol As Long
+    lastCol = LastColInRow(sourceSheet, TASK_LIST_HEADER_ROW)
+    Dim sourceHeaders() As Variant
+    ReDim sourceHeaders(1 To lastCol)
+    Dim c As Long
+    For c = 1 To lastCol
+        sourceHeaders(c) = sourceSheet.Cells(TASK_LIST_HEADER_ROW, c).value
+    Next c
+
+    Dim mirrors As Variant: mirrors = MirrorSheetNames()
+    Dim missingSheets As String
+    Dim i As Long, targetSheet As Worksheet
+
+    Application.EnableEvents = False
+    On Error GoTo SyncCleanup
+    For i = LBound(mirrors) To UBound(mirrors)
+        Set targetSheet = Nothing
+        On Error Resume Next
+        Set targetSheet = wb.Sheets(mirrors(i))
+        On Error GoTo 0
+        If targetSheet Is Nothing Then
+            missingSheets = missingSheets & "- """ & mirrors(i) & """" & vbCrLf
+        Else
+            SyncSheetColumnsTo targetSheet, sourceHeaders
+        End If
+    Next i
+
+    ' Recurring and Task Bundles are deliberately not touched here - tasks flow one way, from
+    ' them onto Task List, never the other way. If you add a new Task List column and want a
+    ' recurring rule or task bundle to fill it in automatically, add that same header on
+    ' Recurring/Task Bundles yourself - RunRecurringEngine/AddTaskBundle already copy any
+    ' matching header with no code change needed, they just won't create one on their own.
+
+SyncCleanup:
+    Application.EnableEvents = True
+
+    If missingSheets <> "" Then
+        MsgBox "Couldn't find these tabs to sync columns to:" & vbCrLf & missingSheets & vbCrLf & "Check for typos or a renamed tab, then try again.", vbExclamation
+    End If
+End Sub
+
+' Makes targetSheet's columns match sourceHeaders, left to right. For each header: if it already
+' exists somewhere on targetSheet, move that column into position; otherwise insert a new blank
+' column for it. Never overwrites an existing column's text - a column that's no longer on Task
+' List (deleted, not renamed) is just left alone rather than guessed at, so nothing is ever
+' silently relabeled or loses its validation. A Task List column with no name yet (blank header)
+' is skipped entirely, so a still-being-typed column never creates a stray blank column here.
+Private Sub SyncSheetColumnsTo(ByVal targetSheet As Worksheet, sourceHeaders() As Variant)
+    Dim headerRow As Long: headerRow = OTHER_SHEETS_HEADER_ROW
+    Dim i As Long
+    Dim expected As String
+
+    ' The rightmost column any correctly-placed header has reached so far. Comparing against
+    ' this (rather than each header's raw position in sourceHeaders) means a gap left by a
+    ' deleted Task List column is simply ignored, instead of triggering pointless moves that
+    ' would shove an unrelated column out of place.
+    Dim lastPlacedCol As Long: lastPlacedCol = 0
+
+    For i = LBound(sourceHeaders) To UBound(sourceHeaders)
+        expected = NormalizeHeader(sourceHeaders(i))
+        If expected <> "" Then
+            Dim existingCols As Object
+            Set existingCols = GetColumnMap(targetSheet, headerRow)
+
+            If existingCols.Exists(expected) Then
+                Dim currentCol As Long: currentCol = CLng(existingCols.Item(expected))
+                If currentCol <= lastPlacedCol Then
+                    ' Out of order relative to what's already placed - move it into position.
+                    MoveColumnTo targetSheet, currentCol, lastPlacedCol + 1
+                    lastPlacedCol = lastPlacedCol + 1
+                Else
+                    ' Already positioned correctly - leave it, gap or no gap.
+                    lastPlacedCol = currentCol
+                End If
+            Else
+                Dim insertCol As Long: insertCol = lastPlacedCol + 1
+                targetSheet.Columns(insertCol).Insert Shift:=xlToRight
+                ' Runs with EnableEvents off, so the usual edit-triggered validation cleanup
+                ' never fires for it - do it directly instead.
+                ClearInheritedValidationOnNewColumns targetSheet, insertCol, insertCol, headerRow
+                targetSheet.Cells(headerRow, insertCol).value = sourceHeaders(i)
+                lastPlacedCol = insertCol
+            End If
+        End If
+    Next i
+    ' Anything never touched above - a tab's own extra column (Done's "Met Deadline?", e.g.) or
+    ' a leftover from a column since deleted on Task List - stays exactly where it is.
+End Sub
+
+' Moves a column via Cut+Insert - preserves data, formatting, and validation, same as dragging a
+' column in the UI.
+Private Sub MoveColumnTo(ByVal ws As Worksheet, ByVal fromCol As Long, ByVal toCol As Long)
+    If fromCol = toCol Then Exit Sub
+    ws.Columns(fromCol).Cut
+    ws.Columns(toCol).Insert Shift:=xlToRight
+    Application.CutCopyMode = False
+End Sub
+
+' Clears Data Validation from a freshly-inserted column's data rows (below the header).
+Private Sub ClearInheritedValidationOnNewColumns(ByVal ws As Worksheet, ByVal startCol As Long, ByVal endCol As Long, ByVal headerRow As Long)
+    Dim c As Long
+    For c = startCol To endCol
+        On Error Resume Next
+        ws.Range(ws.Cells(headerRow + 1, c), ws.Cells(ws.Rows.Count, c)).Validation.Delete
+        On Error GoTo 0
+    Next c
+End Sub
+
+' Called from a sheet's Worksheet_Change to clean up after a manually-inserted column. Excel
+' sometimes carries a neighboring column's Data Validation into a new blank column automatically
+' - a native Excel quirk, not something this code does. A brand new column should start with no
+' restrictions. Only fires for a genuine "Insert Entire Column," never an ordinary cell edit.
+Public Sub ClearValidationIfColumnInsert(ByVal ws As Worksheet, ByVal Target As Range, ByVal headerRow As Long)
+    If Target.Rows.Count = ws.Rows.Count Then
+        ClearInheritedValidationOnNewColumns ws, Target.Column, Target.Column + Target.Columns.Count - 1, headerRow
+    End If
+End Sub
+
+'====================== RECURRENCE CALENDAR MATH ======================
+' ComputeNextOccurrence is the entry point: given a Position/Day/Period rule and a floor date,
+' it finds the earliest matching date on or after that floor. A returned Date of 0 means no
+' result was found.
+
+' Normalizes a Period value to one of PERIOD_DAY/WEEK/MONTH/QUARTER/YEAR, or "" if unrecognized.
+Public Function CanonicalPeriod(ByVal period As Variant) As String
+    Select Case NormalizeHeader(period)
+        Case "day": CanonicalPeriod = PERIOD_DAY
+        Case "week": CanonicalPeriod = PERIOD_WEEK
+        Case "month": CanonicalPeriod = PERIOD_MONTH
+        Case "quarter": CanonicalPeriod = PERIOD_QUARTER
+        Case "year": CanonicalPeriod = PERIOD_YEAR
+        Case Else: CanonicalPeriod = ""
+    End Select
+End Function
+
+' Day name -> VBA's Weekday() numbering (1=Sunday...7=Saturday). found is False if unrecognized.
+Private Function DayNameToIndex(ByVal dayName As Variant, ByRef found As Boolean) As Long
+    found = True
+    Select Case NormalizeHeader(dayName)
+        Case "sunday": DayNameToIndex = 1
+        Case "monday": DayNameToIndex = 2
+        Case "tuesday": DayNameToIndex = 3
+        Case "wednesday": DayNameToIndex = 4
+        Case "thursday": DayNameToIndex = 5
+        Case "friday": DayNameToIndex = 6
+        Case "saturday": DayNameToIndex = 7
+        Case Else: found = False
+    End Select
+End Function
+
+' "First"-"Fourth" -> 1-4; "Last" sets isLast instead of a number.
+Private Function PositionNumber(ByVal position As Variant, ByRef isLast As Boolean) As Long
+    isLast = False
+    Select Case NormalizeHeader(position)
+        Case "first": PositionNumber = 1
+        Case "second": PositionNumber = 2
+        Case "third": PositionNumber = 3
+        Case "fourth": PositionNumber = 4
+        Case "last": isLast = True: PositionNumber = 0
+        Case Else: PositionNumber = 0
+    End Select
+End Function
+
+' True if the Day cell is set to "Weekday" - a business-day filter rather than a specific day
+' name. Combined with Position, this means "the Nth (or last) business day of the period" - e.g.
+' Position=Last + Period=Quarter fires on the last business day of the quarter, shifting back to
+' the Friday before if the quarter ends on a weekend.
+Public Function IsWeekdayFilter(ByVal dayName As Variant) As Boolean
+    IsWeekdayFilter = (NormalizeHeader(dayName) = "weekday")
+End Function
+
+' Whether a rule needs Position to resolve: always for the Weekday filter, never for a plain
+' day-of-month, and only outside the Week period for a specific weekday name.
+Public Function RuleNeedsPosition(ByVal period As Variant, ByVal day As Variant) As Boolean
+    If IsWeekdayFilter(day) Then
+        RuleNeedsPosition = True
+    ElseIf ParseDayOfMonth(day) <> -1 Then
+        RuleNeedsPosition = False
+    Else
+        RuleNeedsPosition = (CanonicalPeriod(period) <> PERIOD_WEEK)
+    End If
+End Function
+
+' 1-31 for a numeric Day value, 32 for "Last" (always past any real month length, so it clamps
+' to the actual last day automatically), or -1 if this is a weekday name instead.
+Public Function ParseDayOfMonth(ByVal dayName As Variant) As Long
+    Dim normalized As String
+    normalized = NormalizeHeader(dayName)
+    If normalized = "last" Then
+        ParseDayOfMonth = 32
+        Exit Function
+    End If
+    If normalized <> "" Then
+        If IsNumeric(normalized) Then
+            Dim num As Double: num = CDbl(normalized)
+            If num = Int(num) And num >= 1 And num <= 31 Then
+                ParseDayOfMonth = CLng(num)
+                Exit Function
+            End If
+        End If
+    End If
+    ParseDayOfMonth = -1
+End Function
+
+Public Function DateOnly(ByVal d As Date) As Date
+    DateOnly = DateSerial(Year(d), Month(d), day(d))
+End Function
+
+Public Function TodayDateOnly() As Date
+    TodayDateOnly = DateOnly(Now)
+End Function
+
+' Finds the next occurrence of calendar day dayOfMonth on or after notBefore, clamping to that
+' month's actual last day whenever dayOfMonth exceeds it (e.g. "31" in February -> Feb 28/29).
+Public Function NextDayOfMonthOnOrAfter(ByVal notBefore As Date, ByVal dayOfMonth As Long) As Date
+    Dim i As Long, baseDate As Date, lastDayInMonth As Long, useDay As Long, candidate As Date
+    For i = 0 To 12 ' safety bound - real answer always resolves within 1-2 months
+        baseDate = DateSerial(Year(notBefore), Month(notBefore) + i, 1)
+        lastDayInMonth = day(DateSerial(Year(baseDate), Month(baseDate) + 1, 0))
+        If dayOfMonth < lastDayInMonth Then useDay = dayOfMonth Else useDay = lastDayInMonth
+        candidate = DateSerial(Year(baseDate), Month(baseDate), useDay)
+        If candidate >= notBefore Then
+            NextDayOfMonthOnOrAfter = candidate
+            Exit Function
+        End If
+    Next i
+    NextDayOfMonthOnOrAfter = 0
+End Function
+
+Public Function NextWeekdayOnOrAfter(ByVal notBefore As Date, ByVal dayIndex As Long) As Date
+    Dim diff As Long
+    diff = (dayIndex - Weekday(notBefore) + 7) Mod 7
+    NextWeekdayOnOrAfter = notBefore + diff
+End Function
+
+' Every occurrence of dayIndex within [startD, endD], then picks the requested position.
+Private Function NthWeekdayInRange(ByVal startD As Date, ByVal endD As Date, ByVal position As Variant, ByVal dayIndex As Long) As Date
+    Dim occurrences As Collection
+    Set occurrences = New Collection
+    Dim d As Date, diff As Long
+    diff = (dayIndex - Weekday(startD) + 7) Mod 7
+    d = startD + diff
+    Do While d <= endD
+        occurrences.Add d
+        d = d + 7
+    Loop
+
+    If occurrences.Count = 0 Then
+        NthWeekdayInRange = 0
+        Exit Function
+    End If
+
+    Dim isLast As Boolean, posNum As Long
+    posNum = PositionNumber(position, isLast)
+    If isLast Then
+        NthWeekdayInRange = occurrences(occurrences.Count)
+    ElseIf posNum >= 1 And posNum <= occurrences.Count Then
+        NthWeekdayInRange = occurrences(posNum)
+    Else
+        NthWeekdayInRange = 0
+    End If
+End Function
+
+Private Function IsBusinessDay(ByVal d As Date) As Boolean
+    Dim w As Long: w = Weekday(d) ' 1=Sunday..7=Saturday, VBA default
+    IsBusinessDay = (w <> vbSunday And w <> vbSaturday)
+End Function
+
+' Every business day within [startD, endD], then picks the requested position. Walking
+' day-by-day naturally lands "Last" on the Friday before a weekend period-end, since a
+' Saturday/Sunday end date is just never counted.
+Private Function NthBusinessDayInRange(ByVal startD As Date, ByVal endD As Date, ByVal position As Variant) As Date
+    Dim occurrences As Collection
+    Set occurrences = New Collection
+    Dim d As Date
+    d = startD
+    Do While d <= endD
+        If IsBusinessDay(d) Then occurrences.Add d
+        d = d + 1
+    Loop
+
+    If occurrences.Count = 0 Then
+        NthBusinessDayInRange = 0
+        Exit Function
+    End If
+
+    Dim isLast As Boolean, posNum As Long
+    posNum = PositionNumber(position, isLast)
+    If isLast Then
+        NthBusinessDayInRange = occurrences(occurrences.Count)
+    ElseIf posNum >= 1 And posNum <= occurrences.Count Then
+        NthBusinessDayInRange = occurrences(posNum)
+    Else
+        NthBusinessDayInRange = 0
+    End If
+End Function
+
+Private Function GetWeekBounds(ByVal refDate As Date) As Variant
+    ' Week starts Sunday, matching Weekday()'s 1=Sunday convention used throughout.
+    Dim d As Date: d = refDate - (Weekday(refDate) - 1)
+    GetWeekBounds = Array(d, d + 6)
+End Function
+Private Function AdvanceWeekBounds(ByVal bounds As Variant) As Variant
+    AdvanceWeekBounds = Array(CDate(bounds(0)) + 7, CDate(bounds(1)) + 7)
+End Function
+
+Private Function GetMonthBounds(ByVal refDate As Date) As Variant
+    Dim y As Long, m As Long
+    y = Year(refDate): m = Month(refDate)
+    GetMonthBounds = Array(DateSerial(y, m, 1), DateSerial(y, m + 1, 0))
+End Function
+Private Function AdvanceMonthBounds(ByVal bounds As Variant) As Variant
+    Dim startD As Date: startD = bounds(0)
+    AdvanceMonthBounds = GetMonthBounds(DateSerial(Year(startD), Month(startD) + 1, 1))
+End Function
+
+Private Function GetQuarterBounds(ByVal refDate As Date) As Variant
+    Dim y As Long, qStartMonth As Long
+    y = Year(refDate)
+    qStartMonth = ((Month(refDate) - 1) \ 3) * 3 + 1
+    GetQuarterBounds = Array(DateSerial(y, qStartMonth, 1), DateSerial(y, qStartMonth + 3, 0))
+End Function
+Private Function AdvanceQuarterBounds(ByVal bounds As Variant) As Variant
+    Dim endD As Date: endD = bounds(1)
+    AdvanceQuarterBounds = GetQuarterBounds(DateSerial(Year(endD), Month(endD) + 1, 1))
+End Function
+
+Private Function GetYearBounds(ByVal refDate As Date) As Variant
+    Dim y As Long: y = Year(refDate)
+    GetYearBounds = Array(DateSerial(y, 1, 1), DateSerial(y, 12, 31))
+End Function
+Private Function AdvanceYearBounds(ByVal bounds As Variant) As Variant
+    Dim endD As Date: endD = bounds(1)
+    AdvanceYearBounds = GetYearBounds(DateSerial(Year(endD) + 1, 1, 1))
+End Function
+
+' Finds the next date matching a Position/Day/Period rule, on or after notBefore.
+Public Function ComputeNextOccurrence(ByVal position As Variant, ByVal dayName As Variant, ByVal period As Variant, ByVal notBefore As Date) As Date
+    Dim period_ As String
+    period_ = CanonicalPeriod(period)
+
+    ' A plain calendar day ("5") or "Last" only applies to the Month period - one candidate per
+    ' month either way, so Position is never read for this case.
+    If period_ = PERIOD_MONTH Then
+        Dim dayOfMonth As Long
+        dayOfMonth = ParseDayOfMonth(dayName)
+        If dayOfMonth <> -1 Then
+            ComputeNextOccurrence = NextDayOfMonthOnOrAfter(notBefore, dayOfMonth)
+            Exit Function
+        End If
+    End If
+
+    ' "Weekday" filter - the Nth (or last) business day of the period.
+    If IsWeekdayFilter(dayName) Then
+        Dim wBounds As Variant
+        Select Case period_
+            Case PERIOD_WEEK: wBounds = GetWeekBounds(notBefore)
+            Case PERIOD_MONTH: wBounds = GetMonthBounds(notBefore)
+            Case PERIOD_QUARTER: wBounds = GetQuarterBounds(notBefore)
+            Case PERIOD_YEAR: wBounds = GetYearBounds(notBefore)
+            Case Else
+                ComputeNextOccurrence = 0
+                Exit Function
+        End Select
+
+        Dim wi As Long, wCandidate As Date
+        For wi = 1 To 5 ' safety bound - real answer always resolves within 1-2 iterations
+            wCandidate = NthBusinessDayInRange(wBounds(0), wBounds(1), position)
+            If wCandidate <> 0 Then
+                If wCandidate >= notBefore Then
+                    ComputeNextOccurrence = wCandidate
+                    Exit Function
+                End If
+            End If
+            Select Case period_
+                Case PERIOD_WEEK: wBounds = AdvanceWeekBounds(wBounds)
+                Case PERIOD_MONTH: wBounds = AdvanceMonthBounds(wBounds)
+                Case PERIOD_QUARTER: wBounds = AdvanceQuarterBounds(wBounds)
+                Case PERIOD_YEAR: wBounds = AdvanceYearBounds(wBounds)
+            End Select
+        Next wi
+        ComputeNextOccurrence = 0
+        Exit Function
+    End If
+
+    Dim found As Boolean, dayIndex As Long
+    dayIndex = DayNameToIndex(dayName, found)
+    If Not found Then
+        ComputeNextOccurrence = 0
+        Exit Function
+    End If
+
+    If period_ = PERIOD_WEEK Then
+        ComputeNextOccurrence = NextWeekdayOnOrAfter(notBefore, dayIndex)
+        Exit Function
+    End If
+
+    Dim bounds As Variant
+    Select Case period_
+        Case PERIOD_MONTH: bounds = GetMonthBounds(notBefore)
+        Case PERIOD_QUARTER: bounds = GetQuarterBounds(notBefore)
+        Case PERIOD_YEAR: bounds = GetYearBounds(notBefore)
+        Case Else
+            ComputeNextOccurrence = 0
+            Exit Function
+    End Select
+
+    Dim i As Long, candidate As Date
+    For i = 1 To 5 ' safety bound - real answer always resolves within 1-2 iterations
+        candidate = NthWeekdayInRange(bounds(0), bounds(1), position, dayIndex)
+        If candidate <> 0 Then
+            If candidate >= notBefore Then
+                ComputeNextOccurrence = candidate
+                Exit Function
+            End If
+        End If
+        Select Case period_
+            Case PERIOD_MONTH: bounds = AdvanceMonthBounds(bounds)
+            Case PERIOD_QUARTER: bounds = AdvanceQuarterBounds(bounds)
+            Case PERIOD_YEAR: bounds = AdvanceYearBounds(bounds)
+        End Select
+    Next i
+    ComputeNextOccurrence = 0
+End Function
+
+' Earliest date a "next occurrence" search should consider: the day after Last Added, or today
+' if the rule has never fired.
+Public Function ComputeFloorDate(ByVal lastAdded As Variant) As Date
+    If IsDate(lastAdded) Then
+        ComputeFloorDate = DateOnly(CDate(lastAdded)) + 1
+    Else
+        ComputeFloorDate = TodayDateOnly()
+    End If
+End Function
+
+'====================== LIVE NEXT ADD (Recurring sheet edit) ======================
+' Recomputes "Next Add Date" the moment a recurrence rule changes, so a wrong combination is
+' obvious right away instead of days later when nothing fires. Called from Recurring's
+' Worksheet_Change.
+
+' Recalculates "Next Add Date" for whatever rows were just edited.
+Public Sub HandleRecurringRuleEdit(ByVal sh As Worksheet, ByVal Target As Range)
+    On Error GoTo CleanupErr
+    ClearValidationIfColumnInsert sh, Target, OTHER_SHEETS_HEADER_ROW
+
+    Dim cols As Object: Set cols = GetColumnMap(sh, OTHER_SHEETS_HEADER_ROW)
+    Dim positionCol As Long, dayCol As Long, periodCol As Long, lastAddedCol As Long, nextAddCol As Long
+    positionCol = GetCol(cols, COL_REC_POSITION)
+    dayCol = GetCol(cols, COL_REC_DAY)
+    periodCol = GetCol(cols, COL_REC_PERIOD)
+    lastAddedCol = GetCol(cols, COL_REC_LAST_ADDED)
+    nextAddCol = GetCol(cols, COL_REC_NEXT_ADD)
+
+    If positionCol = 0 Or dayCol = 0 Or periodCol = 0 Or nextAddCol = 0 Then
+        RequireColumns cols, Array(COL_REC_POSITION, COL_REC_DAY, COL_REC_PERIOD, COL_REC_LAST_ADDED, COL_REC_NEXT_ADD), RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW
+        Exit Sub
+    End If
+
+    Dim startCol As Long, endCol As Long
+    startCol = Target.Column
+    endCol = startCol + Target.Columns.Count - 1
+    Dim touchesRule As Boolean
+    touchesRule = (positionCol >= startCol And positionCol <= endCol) Or (dayCol >= startCol And dayCol <= endCol) Or (periodCol >= startCol And periodCol <= endCol)
+    If Not touchesRule Then Exit Sub
+
+    Application.EnableEvents = False
+
+    Dim startRow As Long, numRows As Long, i As Long, r As Long
+    startRow = Target.row
+    numRows = Target.Rows.Count
+    For i = 0 To numRows - 1
+        r = startRow + i
+        If r > OTHER_SHEETS_HEADER_ROW Then
+            RefreshNextAddForRow sh, r, positionCol, dayCol, periodCol, lastAddedCol, nextAddCol
+        End If
+    Next i
+
+    Application.EnableEvents = True
+    Exit Sub
+
+CleanupErr:
+    Application.EnableEvents = True
+End Sub
+
+' Recalculates one row's "Next Add Date" from its Position/Day/Period/Last Added values.
+Private Sub RefreshNextAddForRow(ByVal sh As Worksheet, ByVal row As Long, ByVal positionCol As Long, ByVal dayCol As Long, ByVal periodCol As Long, ByVal lastAddedCol As Long, ByVal nextAddCol As Long)
+    Dim period As Variant: period = sh.Cells(row, periodCol).value
+    If period = "" Then
+        sh.Cells(row, nextAddCol).value = ""
+        Exit Sub
+    End If
+
+    If CanonicalPeriod(period) = PERIOD_DAY Then
+        ' Daily rules are just checked on file-open or via the manual button, so there's no
+        ' fixed future time to name - the next real check is today if not already added today,
+        ' else tomorrow.
+        Dim dailyLastAdded As Variant
+        If lastAddedCol > 0 Then dailyLastAdded = sh.Cells(row, lastAddedCol).value Else dailyLastAdded = ""
+        sh.Cells(row, nextAddCol).value = ComputeFloorDate(dailyLastAdded)
+        Exit Sub
+    End If
+
+    Dim position As Variant, day As Variant
+    position = sh.Cells(row, positionCol).value
+    day = sh.Cells(row, dayCol).value
+    Dim needsPosition As Boolean
+    needsPosition = RuleNeedsPosition(period, day)
+    If (needsPosition And position = "") Or day = "" Then
+        sh.Cells(row, nextAddCol).value = ""
+        Exit Sub
+    End If
+
+    Dim lastAdded As Variant
+    If lastAddedCol > 0 Then lastAdded = sh.Cells(row, lastAddedCol).value Else lastAdded = ""
+    Dim nextDate As Date
+    nextDate = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded))
+    If nextDate <> 0 Then
+        sh.Cells(row, nextAddCol).value = nextDate
+    Else
+        sh.Cells(row, nextAddCol).value = ""
+    End If
+End Sub
+
+'====================== RECURRING TASKS ======================
+
+' Wired to the "Add Recurring Tasks Now" button.
+Public Sub AddRecurringTasksNow()
+    Dim result As String
+    result = RunRecurringEngine()
+    If result <> "" Then MsgBox result, vbInformation, "Recurring Tasks"
+End Sub
+
+' Called from ThisWorkbook.Workbook_Open - checks for due recurring tasks and refreshes Task
+' List's Start Date every time the file opens. Silent by design.
+Public Sub OnWorkbookOpen()
+    On Error Resume Next
+    RunRecurringEngine
+    RefreshTaskListStartDate
+    On Error GoTo 0
+End Sub
+
+' Updates Task List's "Start Date:" value to the most recent occurrence of the configured
+' week-start day on or before today. Runs on file open, so it won't update live while the file
+' stays open across a day change.
+Public Sub RefreshTaskListStartDate()
+    Dim taskListWs As Worksheet
+    On Error Resume Next
+    Set taskListWs = ThisWorkbook.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If taskListWs Is Nothing Then Exit Sub
+
+    Dim valueCell As Range
+    Set valueCell = FindLabeledCellRight(taskListWs, START_DATE_LABEL_TEXT)
+    If valueCell Is Nothing Then Exit Sub
+
+    valueCell.value = WeekStartOnOrBefore(TodayDateOnly())
+    If valueCell.NumberFormat = "General" Then valueCell.NumberFormat = "m/d/yyyy"
+End Sub
+
+' Adds any recurring task that's due. Called by the manual button and by Workbook_Open's
+' catch-up check; returns a status message the button shows and Workbook_Open ignores.
+Public Function RunRecurringEngine() As String
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim recurringSheet As Worksheet, taskListSheet As Worksheet
+    On Error Resume Next
+    Set recurringSheet = wb.Sheets(RECURRING_SHEET)
+    Set taskListSheet = wb.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If recurringSheet Is Nothing Or taskListSheet Is Nothing Then
+        RunRecurringEngine = "Couldn't find the """ & RECURRING_SHEET & """ or """ & TASK_LIST_SHEET & """ tab."
+        Exit Function
+    End If
+
+    Dim recCols As Object, taskListCols As Object
+    Set recCols = GetColumnMap(recurringSheet, OTHER_SHEETS_HEADER_ROW)
+    Set taskListCols = GetColumnMap(taskListSheet, TASK_LIST_HEADER_ROW)
+
+    If Not RequireColumns(recCols, Array(COL_REC_POSITION, COL_REC_DAY, COL_REC_PERIOD, COL_REC_LAST_ADDED, COL_REC_NEXT_ADD), RECURRING_SHEET, OTHER_SHEETS_HEADER_ROW) Then
+        RunRecurringEngine = "": Exit Function
+    End If
+    If Not RequireColumns(taskListCols, Array(COL_TASK_ADDED), TASK_LIST_SHEET, TASK_LIST_HEADER_ROW) Then
+        RunRecurringEngine = "": Exit Function
+    End If
+
+    ' Global pause - nothing fires, for any rule, while today is before the Resume Date.
+    Dim today As Date: today = TodayDateOnly()
+    Dim resumeDateCol As Long: resumeDateCol = GetCol(recCols, COL_REC_RESUME_DATE)
+    Dim resumeVal As Variant
+    If resumeDateCol > 0 Then resumeVal = recurringSheet.Cells(OTHER_SHEETS_HEADER_ROW + 1, resumeDateCol).value
+    If IsDate(resumeVal) Then
+        If DateOnly(CDate(resumeVal)) > today Then
+            RunRecurringEngine = "Recurring tasks are paused until " & Format(resumeVal, "mm/dd/yyyy") & "."
+            Exit Function
+        End If
+    End If
+
+    ' Any header present on BOTH sheets is copied automatically - add a matching column to
+    ' Recurring and Task List and it's picked up here with no code changes needed.
+    Dim sharedFields As Collection: Set sharedFields = New Collection
+    Dim key As Variant
+    For Each key In taskListCols.Keys
+        If recCols.Exists(key) Then sharedFields.Add key
+    Next key
+    If sharedFields.Count = 0 Then
+        RunRecurringEngine = "Couldn't find any matching column headers between """ & RECURRING_SHEET & """ and """ & TASK_LIST_SHEET & """."
+        Exit Function
+    End If
+
+    Dim lastRow As Long: lastRow = LastDataRow(recurringSheet, OTHER_SHEETS_HEADER_ROW)
+    Dim numDataRows As Long: numDataRows = lastRow - OTHER_SHEETS_HEADER_ROW
+    If numDataRows <= 0 Then
+        RunRecurringEngine = ""
+        Exit Function
+    End If
+
+    Dim positionCol As Long, dayCol As Long, periodCol As Long, lastAddedCol As Long, nextAddCol As Long, deadlineOffsetCol As Long
+    positionCol = GetCol(recCols, COL_REC_POSITION)
+    dayCol = GetCol(recCols, COL_REC_DAY)
+    periodCol = GetCol(recCols, COL_REC_PERIOD)
+    lastAddedCol = GetCol(recCols, COL_REC_LAST_ADDED)
+    nextAddCol = GetCol(recCols, COL_REC_NEXT_ADD)
+    ' Recurring's own "Deadline" column is a number, not a date - days to complete counting
+    ' from whenever the task is actually added (1 = due same day, 2 = due the next day, etc.).
+    deadlineOffsetCol = GetCol(recCols, COL_DEADLINE)
+
+    Dim taskAddedCol As Long, deadlineColOnTaskList As Long, linkColOnRecurring As Long, linkColOnTaskList As Long
+    taskAddedCol = GetCol(taskListCols, COL_TASK_ADDED)
+    deadlineColOnTaskList = GetCol(taskListCols, COL_DEADLINE)
+    linkColOnRecurring = GetCol(recCols, COL_LINK)
+    linkColOnTaskList = GetCol(taskListCols, COL_LINK)
+    Dim nowFormatted As Date: nowFormatted = Now
+
+    Dim addedCount As Long: addedCount = 0
+    Dim r As Long, row As Long
+    Dim period As Variant, lastAdded As Variant, due As Boolean, position As Variant, day As Variant
+    Dim nextOccurrence As Date
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    On Error GoTo EngineCleanup
+
+    For r = 0 To numDataRows - 1
+        row = OTHER_SHEETS_HEADER_ROW + 1 + r
+        period = recurringSheet.Cells(row, periodCol).value
+        If period <> "" Then
+            lastAdded = recurringSheet.Cells(row, lastAddedCol).value
+            due = False
+
+            If CanonicalPeriod(period) = PERIOD_DAY Then
+                ' Daily means "add if not already added today," checked on file-open and via
+                ' the manual button.
+                Dim lastAddedIsToday As Boolean
+                lastAddedIsToday = IsDate(lastAdded) And (DateOnly(CDate(lastAdded)) = today)
+                due = Not lastAddedIsToday
+            Else
+                position = recurringSheet.Cells(row, positionCol).value
+                day = recurringSheet.Cells(row, dayCol).value
+                Dim needsPosition As Boolean
+                needsPosition = RuleNeedsPosition(period, day)
+                If Not ((needsPosition And position = "") Or day = "") Then
+                    nextOccurrence = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded))
+                    If nextOccurrence <> 0 Then due = (nextOccurrence <= today)
+                End If
+            End If
+
+            If due Then
+                Dim targetRow As Long
+                targetRow = TargetAppendRow(taskListSheet)
+
+                ' Link and Deadline are handled separately below - Link needs a real Copy to
+                ' preserve the hyperlink, and Deadline needs the offset-to-date math further down.
+                Dim f As Variant, fieldCol As Long
+                For Each f In sharedFields
+                    If f <> NormalizeHeader(COL_LINK) And f <> NormalizeHeader(COL_DEADLINE) Then
+                        fieldCol = taskListCols.Item(f)
+                        taskListSheet.Cells(targetRow, fieldCol).value = recurringSheet.Cells(row, recCols.Item(f)).value
+                    End If
+                Next f
+                If linkColOnRecurring > 0 And linkColOnTaskList > 0 Then
+                    ' xlPasteAllExceptBorders keeps the hyperlink but leaves Task List's own
+                    ' border formatting alone, instead of also copying Recurring's borders.
+                    recurringSheet.Cells(row, linkColOnRecurring).Copy
+                    taskListSheet.Cells(targetRow, linkColOnTaskList).PasteSpecial Paste:=xlPasteAllExceptBorders
+                    Application.CutCopyMode = False
+                End If
+                If taskAddedCol > 0 Then taskListSheet.Cells(targetRow, taskAddedCol).value = nowFormatted
+
+                ' Deadline counts from today (when the task is actually published), not from
+                ' whenever it was theoretically due - so a late-firing catch-up still gets a
+                ' sensible deadline instead of one that's already overdue.
+                If deadlineOffsetCol > 0 And deadlineColOnTaskList > 0 Then
+                    Dim deadlineOffset As Variant
+                    deadlineOffset = recurringSheet.Cells(row, deadlineOffsetCol).value
+                    If deadlineOffset <> "" Then
+                        If IsNumeric(deadlineOffset) Then
+                            taskListSheet.Cells(targetRow, deadlineColOnTaskList).value = today + (CLng(deadlineOffset) - 1)
+                        End If
+                    End If
+                End If
+
+                addedCount = addedCount + 1
+
+                recurringSheet.Cells(row, lastAddedCol).value = today
+                If CanonicalPeriod(period) = PERIOD_DAY Then
+                    ' Last Added is now today, so the next check is tomorrow.
+                    recurringSheet.Cells(row, nextAddCol).value = ComputeFloorDate(today)
+                Else
+                    Dim newNextAdd As Date
+                    newNextAdd = ComputeNextOccurrence(position, day, period, ComputeFloorDate(today))
+                    If newNextAdd <> 0 Then
+                        recurringSheet.Cells(row, nextAddCol).value = newNextAdd
+                    Else
+                        recurringSheet.Cells(row, nextAddCol).value = ""
+                    End If
+                End If
+            End If
+        End If
+    Next r
+
+EngineCleanup:
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+
+    If Err.Number <> 0 Then
+        Dim errMsg As String: errMsg = Err.Description
+        Err.Clear
+        RunRecurringEngine = "Something went wrong adding recurring tasks: " & errMsg
+        Exit Function
+    End If
+
+    If addedCount > 0 Then
+        SortTaskListByDeadlineThenPriority
+        RunRecurringEngine = "Added " & addedCount & " recurring task(s) and re-sorted Task List."
+    Else
+        RunRecurringEngine = ""
+    End If
+End Function
+
+'====================== EDIT HANDLING (Task List / Parked) ======================
+' Called from Task List's and Parked's Worksheet_Change.
+
+' True if this edit looks like part of a rapid multi-row burst (a fill-drag or multi-cell
+' paste) - HandleActionableEdit's broader sweep only runs when that's actually happening.
+Private Function IsPartOfProgressEditBurst(ByVal numRows As Long) As Boolean
+    If numRows > 1 Then
+        IsPartOfProgressEditBurst = True
+        Exit Function
+    End If
+    Static lastEditTime As Date
+    Dim nowT As Date: nowT = Now
+    If lastEditTime <> 0 Then
+        If (nowT - lastEditTime) * 86400 <= 10 Then IsPartOfProgressEditBurst = True
+    End If
+    lastEditTime = nowT
+End Function
+
+' Handles an edit to Task List or Parked - syncs columns, stamps timestamps, and routes rows
+' whose Progress value changed.
+Public Sub HandleActionableEdit(ByVal sh As Worksheet, ByVal Target As Range)
+    On Error GoTo EditCleanupErr
+    Dim sheetName As String: sheetName = sh.name
+    Dim headerRow As Long: headerRow = HeaderRowFor(sheetName)
+
+    ' Auto-propagate a new/renamed header on Task List to every mirror tab (Parked, Done).
+    If sheetName = TASK_LIST_SHEET Then
+        Dim editedStartRow As Long, editedEndRow As Long
+        editedStartRow = Target.row
+        editedEndRow = editedStartRow + Target.Rows.Count - 1
+        If TASK_LIST_HEADER_ROW >= editedStartRow And TASK_LIST_HEADER_ROW <= editedEndRow Then
+            SyncColumnHeaders
+        End If
+    End If
+
+    ClearValidationIfColumnInsert sh, Target, headerRow
+
+    If sheetName <> TASK_LIST_SHEET And sheetName <> PARKED_SHEET Then Exit Sub
+
+    Dim cols As Object: Set cols = GetColumnMap(sh, headerRow)
+    Dim taskNameCol As Long, progressCol As Long, deadlineCol As Long
+    taskNameCol = GetCol(cols, COL_TASK_NAME)
+    progressCol = GetCol(cols, COL_PROGRESS)
+    deadlineCol = GetCol(cols, COL_DEADLINE)
+
+    If taskNameCol = 0 Or progressCol = 0 Then
+        ShowStatus "Couldn't find """ & COL_TASK_NAME & """ or """ & COL_PROGRESS & """ on """ & sheetName & """ row " & headerRow & " - automation is paused on this tab until that header's fixed."
+        Exit Sub
+    End If
+
+    Dim editedStartCol As Long, editedEndCol As Long
+    editedStartCol = Target.Column
+    editedEndCol = editedStartCol + Target.Columns.Count - 1
+    Dim touchesTaskName As Boolean, touchesProgress As Boolean, touchesDeadline As Boolean
+    touchesTaskName = (taskNameCol >= editedStartCol And taskNameCol <= editedEndCol)
+    touchesProgress = (progressCol >= editedStartCol And progressCol <= editedEndCol)
+    touchesDeadline = (deadlineCol > 0) And (deadlineCol >= editedStartCol And deadlineCol <= editedEndCol)
+    If Not touchesTaskName And Not touchesProgress And Not touchesDeadline Then Exit Sub
+
+    Dim startRow As Long, numRows As Long
+    startRow = Target.row
+    numRows = Target.Rows.Count
+
+    Application.EnableEvents = False
+
+    ' Process bottom-up: a Progress-triggered move deletes its row and shifts rows below it up
+    ' by one, so working from the highest row down avoids disturbing rows not yet handled.
+    Dim i As Long, r As Long
+    Dim taskAddedC As Long: taskAddedC = GetCol(cols, COL_TASK_ADDED)
+    For i = numRows - 1 To 0 Step -1
+        r = startRow + i
+        If r > headerRow Then
+            If touchesTaskName And taskAddedC > 0 Then
+                Dim nameValue As Variant
+                nameValue = sh.Cells(r, taskNameCol).value
+                If nameValue <> "" Then sh.Cells(r, taskAddedC).value = Now
+            End If
+            If touchesProgress Then
+                Dim progressValue As Variant
+                progressValue = sh.Cells(r, progressCol).value
+                HandleProgressChange sh, r, progressValue, cols
+            End If
+        End If
+    Next i
+
+    ' Final sweep: catches any row whose Progress value still has a route but didn't get moved
+    ' above - a fill-drag fires a separate event per row, and an earlier row's move can shift a
+    ' later row before its own event runs, making the row number it captured stale. Re-reads the
+    ' sheet fresh and finishes the job.
+    If touchesProgress Then
+        If IsPartOfProgressEditBurst(numRows) Then
+            Dim sweepLastRow As Long: sweepLastRow = LastDataRow(sh, headerRow)
+            If sweepLastRow > headerRow Then
+                ' Bulk-read the Progress column once rather than one .Value per row, so a
+                ' bloated used range can't make this slow.
+                Dim sweepRowCount As Long: sweepRowCount = sweepLastRow - headerRow
+                Dim sweepVals As Variant
+                If sweepRowCount = 1 Then
+                    ReDim sweepVals(1 To 1, 1 To 1)
+                    sweepVals(1, 1) = sh.Cells(sweepLastRow, progressCol).value
+                Else
+                    sweepVals = sh.Range(sh.Cells(headerRow + 1, progressCol), sh.Cells(sweepLastRow, progressCol)).value
+                End If
+
+                Dim s As Long
+                For s = sweepLastRow To headerRow + 1 Step -1
+                    Dim sweepValue As Variant
+                    sweepValue = sweepVals(s - headerRow, 1)
+                    If sweepValue <> "" Then
+                        If GetStatusRoute(sweepValue) <> "" Then
+                            HandleProgressChange sh, s, sweepValue, cols
+                        End If
+                    End If
+                Next s
+            End If
+        End If
+    End If
+
+    Application.EnableEvents = True
+
+    ' Re-sort once per edit if Deadline changed on Task List specifically - Parked shares this
+    ' handler but shouldn't trigger a Task List re-sort. (A Progress-triggered move onto Task
+    ' List, e.g. "Ready" from Parked, re-sorts on its own inside HandleProgressChange instead.)
+    If touchesDeadline And sheetName = TASK_LIST_SHEET Then
+        SortTaskListByDeadlineThenPriority
+    End If
+    Exit Sub
+
+EditCleanupErr:
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+End Sub
+
+' Stamps a timestamp for the new Progress value and, if it maps to Done/Parked/Ready, moves the
+' row to that tab.
+Private Sub HandleProgressChange(ByVal sh As Worksheet, ByVal row As Long, ByVal value As Variant, ByVal cols As Object)
+    Dim normalizedValue As String: normalizedValue = NormalizeHeader(value)
+    Dim progressCol As Long: progressCol = GetCol(cols, COL_PROGRESS)
+
+    ' Re-check the live value first - a fill-drag can shift row numbers between when this was
+    ' queued and when it runs, so `row` may no longer hold what triggered this call. The sweep
+    ' in HandleActionableEdit picks up anything skipped here.
+    Dim currentValue As Variant
+    currentValue = sh.Cells(row, progressCol).value
+    If NormalizeHeader(currentValue) <> normalizedValue Then Exit Sub
+
+    Dim completedCol As Long, startedCol As Long
+    completedCol = GetCol(cols, COL_TASK_COMPLETED)
+    startedCol = GetCol(cols, COL_TASK_STARTED)
+    If normalizedValue = NormalizeHeader(STATUS_DONE) And completedCol > 0 Then
+        sh.Cells(row, completedCol).value = Now
+    ElseIf normalizedValue = NormalizeHeader(STATUS_PENDING) And startedCol > 0 Then
+        sh.Cells(row, startedCol).value = Now
+    End If
+
+    Dim targetSheetName As String
+    targetSheetName = GetStatusRoute(value)
+    If targetSheetName = "" Then Exit Sub
+    If targetSheetName = sh.name Then Exit Sub ' already on the target sheet - don't shuffle it
+
+    Dim targetSheet As Worksheet
+    On Error Resume Next
+    Set targetSheet = ThisWorkbook.Sheets(targetSheetName)
+    On Error GoTo 0
+    If targetSheet Is Nothing Then
+        MsgBox "Couldn't find a tab named """ & targetSheetName & """. The task was NOT moved - check that this tab exists and hasn't been renamed, then try again.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim lastCol As Long: lastCol = LastColInRow(sh, HeaderRowFor(sh.name))
+    Dim targetRow As Long: targetRow = TargetAppendRow(targetSheet)
+
+    sh.Rows(row).Resize(1, lastCol).Copy targetSheet.Cells(targetRow, 1)
+    sh.Rows(row).Delete
+
+    ' The copy also carries Task List/Parked's "overdue" red-highlight rule onto Done - wrong
+    ' there, since a completed task's Deadline being in the past isn't a warning. Strip it.
+    If targetSheetName = DONE_SHEET Then
+        StripDeadlineFormattingOnDone targetSheet
+        StampWeeklyStartDateOnDone targetSheet, targetRow
+        StampMetDeadlineFormula targetSheet, targetRow
+    End If
+
+    ' A row landing on Task List (e.g. "Ready" from Parked) always lands appended at the bottom,
+    ' regardless of its Deadline/Priority - re-sort immediately so it doesn't sit out of place.
+    If targetSheetName = TASK_LIST_SHEET Then
+        SortTaskListByDeadlineThenPriority
+    End If
+
+    ShowStatus "Moved to """ & targetSheetName & """"
+End Sub
+
+' Removes the overdue-deadline red-highlight rule from Done's Deadline column.
+Private Sub StripDeadlineFormattingOnDone(ByVal doneSheet As Worksheet)
+    Dim doneCols As Object: Set doneCols = GetColumnMap(doneSheet, HeaderRowFor(DONE_SHEET))
+    Dim deadlineCol As Long: deadlineCol = GetCol(doneCols, COL_DEADLINE)
+    If deadlineCol = 0 Then Exit Sub
+
+    Dim headerRow As Long: headerRow = HeaderRowFor(DONE_SHEET)
+    Dim rng As Range
+    Set rng = doneSheet.Range(doneSheet.Cells(headerRow + 1, deadlineCol), doneSheet.Cells(doneSheet.Rows.Count, deadlineCol))
+    On Error Resume Next
+    rng.FormatConditions.Delete
+    On Error GoTo 0
+End Sub
+
+' Stamps "Start Week" with the configured week-start day on or before this row's own Task
+' Completed date.
+Private Sub StampWeeklyStartDateOnDone(ByVal doneSheet As Worksheet, ByVal row As Long)
+    Dim doneCols As Object: Set doneCols = GetColumnMap(doneSheet, HeaderRowFor(DONE_SHEET))
+    Dim completedCol As Long: completedCol = GetCol(doneCols, COL_TASK_COMPLETED)
+    Dim startWeekCol As Long: startWeekCol = GetCol(doneCols, COL_DONE_START_WEEK)
+    If completedCol = 0 Or startWeekCol = 0 Then Exit Sub
+
+    Dim completedVal As Variant: completedVal = doneSheet.Cells(row, completedCol).value
+    If Not IsDate(completedVal) Then Exit Sub
+
+    Dim targetCell As Range: Set targetCell = doneSheet.Cells(row, startWeekCol)
+    targetCell.value = WeekStartOnOrBefore(CDate(completedVal))
+    ' Give an unformatted cell a sensible default just once, so it shows a date instead of a raw
+    ' serial number - never overwrites a format you've already set (change it any time and it
+    ' sticks, e.g. to DD/MM/YY).
+    If targetCell.NumberFormat = "General" Then targetCell.NumberFormat = "m/d/yyyy"
+End Sub
+
+' Finds a cell anywhere on ws containing exactly labelText (case-insensitive) - the shared search
+' behind FindLabeledCellBelow/FindLabeledCellRight below, letting a freestanding label+value pair
+' be located by what it says rather than where it sits. Returns Nothing if not found.
+Private Function FindLabelCell(ByVal ws As Worksheet, ByVal labelText As String) As Range
+    Set FindLabelCell = ws.Cells.Find(What:=labelText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+End Function
+
+' The cell directly below a label (e.g. Recurring's "Beginning of Week" over a day-name
+' picklist) - Nothing if the label isn't found.
+Public Function FindLabeledCellBelow(ByVal ws As Worksheet, ByVal labelText As String) As Range
+    Dim found As Range: Set found = FindLabelCell(ws, labelText)
+    If Not found Is Nothing Then Set FindLabeledCellBelow = found.Offset(1, 0)
+End Function
+
+' The cell directly to the right of a label (e.g. Task List's "Start Date:" next to its value) -
+' Nothing if the label isn't found.
+Public Function FindLabeledCellRight(ByVal ws As Worksheet, ByVal labelText As String) As Range
+    Dim found As Range: Set found = FindLabelCell(ws, labelText)
+    If Not found Is Nothing Then Set FindLabeledCellRight = found.Offset(0, 1)
+End Function
+
+' The day name below the "Beginning of Week" label, as a VBA Weekday() constant. Defaults to
+' Monday if that cell can't be found, is blank, or holds something unrecognized.
+Private Function GetConfiguredWeekStartDay() As VbDayOfWeek
+    Dim recurringSheet As Worksheet
+    On Error Resume Next
+    Set recurringSheet = ThisWorkbook.Sheets(RECURRING_SHEET)
+    On Error GoTo 0
+    If recurringSheet Is Nothing Then
+        GetConfiguredWeekStartDay = vbMonday
+        Exit Function
+    End If
+
+    Dim valueCell As Range
+    Set valueCell = FindLabeledCellBelow(recurringSheet, WEEK_START_DAY_LABEL_TEXT)
+    If valueCell Is Nothing Then
+        GetConfiguredWeekStartDay = vbMonday
+        Exit Function
+    End If
+
+    Select Case NormalizeHeader(valueCell.value)
+        Case "sunday": GetConfiguredWeekStartDay = vbSunday
+        Case "monday": GetConfiguredWeekStartDay = vbMonday
+        Case "tuesday": GetConfiguredWeekStartDay = vbTuesday
+        Case "wednesday": GetConfiguredWeekStartDay = vbWednesday
+        Case "thursday": GetConfiguredWeekStartDay = vbThursday
+        Case "friday": GetConfiguredWeekStartDay = vbFriday
+        Case "saturday": GetConfiguredWeekStartDay = vbSaturday
+        Case Else: GetConfiguredWeekStartDay = vbMonday
+    End Select
+End Function
+
+' Most recent occurrence of the configured week-start day on or before d - that same date if d
+' already falls on that day.
+Private Function WeekStartOnOrBefore(ByVal d As Date) As Date
+    Dim startDay As VbDayOfWeek: startDay = GetConfiguredWeekStartDay()
+    WeekStartOnOrBefore = DateOnly(d) - (Weekday(d, startDay) - 1)
+End Function
+
+' Writes the "Met Deadline?" formula into the just-moved row, comparing that row's own Deadline
+' and Task Completed columns.
+Private Sub StampMetDeadlineFormula(ByVal doneSheet As Worksheet, ByVal row As Long)
+    Dim doneCols As Object: Set doneCols = GetColumnMap(doneSheet, HeaderRowFor(DONE_SHEET))
+    Dim metDeadlineCol As Long, deadlineCol As Long, completedCol As Long
+    metDeadlineCol = GetCol(doneCols, COL_DONE_MET_DEADLINE)
+    deadlineCol = GetCol(doneCols, COL_DEADLINE)
+    completedCol = GetCol(doneCols, COL_TASK_COMPLETED)
+    If metDeadlineCol = 0 Or deadlineCol = 0 Or completedCol = 0 Then Exit Sub
+
+    Dim deadlineRef As String, completedRef As String
+    deadlineRef = ColumnLetter(deadlineCol) & row
+    completedRef = ColumnLetter(completedCol) & row
+
+    ' INT() strips the time-of-day off both sides before comparing - Deadline defaults to
+    ' midnight, but Task Completed always carries a real timestamp, so completing on the same
+    ' calendar day as the deadline would otherwise always read as "later than" it and show
+    ' Overdue even when the date itself matches.
+    doneSheet.Cells(row, metDeadlineCol).Formula = "=IF(ISBLANK(" & deadlineRef & "),""""," & _
+        "IF(INT(" & completedRef & ")<=INT(" & deadlineRef & "),""On Time"",""Overdue""))"
+End Sub
+
+'====================== SORTING ======================
+
+' Reads the live priority order from Recurring's "Priority Options" column, top to bottom -
+' editing that list changes the sort with no code change needed. Falls back to a hardcoded
+' default only if that column can't be found or is empty.
+Public Function GetPriorityOrder() As Variant
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(RECURRING_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        GetPriorityOrder = DefaultPriorityOrder()
+        Exit Function
+    End If
+
+    Dim cols As Object: Set cols = GetColumnMap(ws, OTHER_SHEETS_HEADER_ROW)
+    Dim col As Long: col = GetCol(cols, COL_PRIORITY_OPTIONS)
+    If col = 0 Then
+        MsgBox "Couldn't find a """ & COL_PRIORITY_OPTIONS & """ column on """ & RECURRING_SHEET & """, so sorting is using the built-in default Priority order instead of your custom one." & vbCrLf & vbCrLf & "Add a column headered exactly """ & COL_PRIORITY_OPTIONS & """ to fix this.", vbExclamation
+        GetPriorityOrder = DefaultPriorityOrder()
+        Exit Function
+    End If
+
+    Dim lastRow As Long: lastRow = LastDataRow(ws, OTHER_SHEETS_HEADER_ROW)
+    If lastRow <= OTHER_SHEETS_HEADER_ROW Then
+        GetPriorityOrder = DefaultPriorityOrder()
+        Exit Function
+    End If
+
+    Dim result() As String
+    ReDim result(0 To lastRow - OTHER_SHEETS_HEADER_ROW - 1)
+    Dim n As Long: n = 0
+    Dim r As Long, v As Variant
+    For r = OTHER_SHEETS_HEADER_ROW + 1 To lastRow
+        v = ws.Cells(r, col).value
+        If v <> "" Then
+            result(n) = CStr(v)
+            n = n + 1
+        End If
+    Next r
+
+    If n = 0 Then
+        GetPriorityOrder = DefaultPriorityOrder()
+    Else
+        ReDim Preserve result(0 To n - 1)
+        GetPriorityOrder = result
+    End If
+End Function
+
+Private Function DefaultPriorityOrder() As Variant
+    DefaultPriorityOrder = Array("Recurring", "Top", "High", "Medium", "Low", "Follow up", "Unable to Start")
+End Function
+
+' Rank for a cell's text: position in orderList (0 = highest). Unrecognized or blank values
+' sort to the very end rather than breaking the sort.
+Private Function PriorityRank(ByVal value As Variant, ByVal orderList As Variant) As Long
+    Dim normalized As String: normalized = NormalizeHeader(value)
+    Dim i As Long
+    For i = LBound(orderList) To UBound(orderList)
+        If NormalizeHeader(orderList(i)) = normalized Then
+            PriorityRank = i - LBound(orderList)
+            Exit Function
+        End If
+    Next i
+    PriorityRank = UBound(orderList) - LBound(orderList) + 1
+End Function
+
+' -1/0/1 comparison for the sort below: Deadline first, then Priority.
+Private Function CompareEntries(ByVal aIdx As Long, ByVal bIdx As Long, ByRef deadlineKey() As Double, ByRef priorityKey() As Long) As Long
+    If deadlineKey(aIdx) <> deadlineKey(bIdx) Then
+        If deadlineKey(aIdx) < deadlineKey(bIdx) Then CompareEntries = -1 Else CompareEntries = 1
+    ElseIf priorityKey(aIdx) <> priorityKey(bIdx) Then
+        If priorityKey(aIdx) < priorityKey(bIdx) Then CompareEntries = -1 Else CompareEntries = 1
+    Else
+        CompareEntries = 0
+    End If
+End Function
+
+' Wired to the "Sort by Deadline & Priority" button. Sorts Task List by Deadline, then Priority.
+' Reorders rows by physically moving them (like dragging a row in the UI) rather than rewriting
+' cell values, so hyperlinks, formulas, and formatting all move with their row intact.
+Public Sub SortTaskListByDeadlineThenPriority()
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then Exit Sub
+
+    Dim cols As Object: Set cols = GetColumnMap(ws, TASK_LIST_HEADER_ROW)
+    If Not RequireColumns(cols, Array(COL_PRIORITY, COL_DEADLINE), TASK_LIST_SHEET, TASK_LIST_HEADER_ROW) Then Exit Sub
+
+    Dim firstDataRow As Long: firstDataRow = TASK_LIST_HEADER_ROW + 1
+    Dim lastRow As Long: lastRow = LastDataRow(ws, TASK_LIST_HEADER_ROW)
+    Dim numRows As Long: numRows = lastRow - TASK_LIST_HEADER_ROW
+    If numRows <= 1 Then Exit Sub
+
+    Dim deadlineCol As Long, priorityCol As Long
+    deadlineCol = GetCol(cols, COL_DEADLINE)
+    priorityCol = GetCol(cols, COL_PRIORITY)
+    Dim priorityOrder As Variant: priorityOrder = GetPriorityOrder()
+
+    ' Read both columns in one call each rather than cell by cell - much faster, and immune to
+    ' a bloated used range slowing things down.
+    Dim deadlineVals As Variant, priorityVals As Variant
+    deadlineVals = ws.Range(ws.Cells(firstDataRow, deadlineCol), ws.Cells(lastRow, deadlineCol)).value
+    priorityVals = ws.Range(ws.Cells(firstDataRow, priorityCol), ws.Cells(lastRow, priorityCol)).value
+
+    Dim deadlineKey() As Double, priorityKey() As Long, order() As Long, currentOffset() As Long
+    ReDim deadlineKey(0 To numRows - 1)
+    ReDim priorityKey(0 To numRows - 1)
+    ReDim order(0 To numRows - 1)
+    ReDim currentOffset(0 To numRows - 1)
+
+    Dim i As Long, dv As Variant
+    For i = 0 To numRows - 1
+        dv = deadlineVals(i + 1, 1)
+        If IsDate(dv) Then
+            deadlineKey(i) = CDbl(CDate(dv))
+        Else
+            deadlineKey(i) = 2958465 ' Excel's max date serial (12/31/9999) - blanks sort last
+        End If
+        priorityKey(i) = PriorityRank(priorityVals(i + 1, 1), priorityOrder)
+        order(i) = i
+        currentOffset(i) = i
+    Next i
+
+    Dim j As Long, tmp As Long
+    For i = 1 To numRows - 1
+        j = i
+        Do While j > 0
+            If CompareEntries(order(j), order(j - 1), deadlineKey, priorityKey) < 0 Then
+                tmp = order(j): order(j) = order(j - 1): order(j - 1) = tmp
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+    Next i
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    On Error GoTo SortCleanup
+
+    Dim targetPos As Long, wantedOriginalOffset As Long, fromOffset As Long, sourceRow As Long, destRow As Long
+    For targetPos = 0 To numRows - 1
+        wantedOriginalOffset = order(targetPos)
+        fromOffset = currentOffset(wantedOriginalOffset)
+        If fromOffset <> targetPos Then
+            sourceRow = firstDataRow + fromOffset
+            destRow = firstDataRow + targetPos
+            ws.Rows(sourceRow).Cut
+            ws.Rows(destRow).Insert Shift:=xlDown
+            Application.CutCopyMode = False
+
+            For i = 0 To numRows - 1
+                If currentOffset(i) >= targetPos And currentOffset(i) < fromOffset Then
+                    currentOffset(i) = currentOffset(i) + 1
+                End If
+            Next i
+            currentOffset(wantedOriginalOffset) = targetPos
+        End If
+    Next targetPos
+
+SortCleanup:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    ShowStatus "Sorted: Deadline > Priority"
+End Sub
+
+
+'====================== TASK BUNDLES ======================
+' On-demand groups of tasks (e.g. "New Hire" = 8 setup tasks), added all at once by picking a
+' name from the dropdown next to the "Add Task Bundle" button. Safe to run repeatedly - every
+' use adds a fresh copy, with no "already added" tracking.
+
+' Wired to the "Add Task Bundle" button. Reads the dropdown cell to the left of wherever the
+' "Select Project" label currently sits (found by searching row 1 for that text, not a fixed
+' column) and adds that bundle. Stays on row 1 on purpose - Task List's real headers are on
+' row 2, so anything placed there gets misread as one.
+Public Sub AddSelectedTaskBundle()
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        MsgBox "Couldn't find the """ & TASK_LIST_SHEET & """ tab.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim headerCell As Range
+    Set headerCell = FindBundlePickerHeaderCell(ws)
+    If headerCell Is Nothing Then
+        MsgBox "Couldn't find the """ & BUNDLE_PICKER_HEADER_TEXT & """ header on """ & TASK_LIST_SHEET & """ row " & BUNDLE_PICKER_HEADER_ROW & " - it may have been renamed, moved to a different row, or deleted.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim chosen As Variant
+    chosen = headerCell.Offset(0, -1).value
+    If chosen = "" Then
+        MsgBox "Pick a bundle from the dropdown next to """ & BUNDLE_PICKER_HEADER_TEXT & """ first.", vbExclamation
+        Exit Sub
+    End If
+
+    AddTaskBundle CStr(chosen)
+End Sub
+
+' Finds the "Select Project" label cell on row 1, wherever it currently is - the dropdown is
+' the cell directly to its left.
+Private Function FindBundlePickerHeaderCell(ByVal ws As Worksheet) As Range
+    Dim lastCol As Long: lastCol = LastColInRow(ws, BUNDLE_PICKER_HEADER_ROW)
+    Dim needle As String: needle = NormalizeHeader(BUNDLE_PICKER_HEADER_TEXT)
+    Dim c As Long
+    For c = 1 To lastCol
+        ' Contains rather than exact match, so a decorative addition like an arrow still matches.
+        If InStr(1, NormalizeHeader(ws.Cells(BUNDLE_PICKER_HEADER_ROW, c).value), needle, vbTextCompare) > 0 Then
+            Set FindBundlePickerHeaderCell = ws.Cells(BUNDLE_PICKER_HEADER_ROW, c)
+            Exit Function
+        End If
+    Next c
+End Function
+
+' Copies every Task Bundles row whose Project matches projectName onto Task List.
+Public Sub AddTaskBundle(ByVal projectName As String)
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim bundlesSheet As Worksheet, taskListSheet As Worksheet
+    On Error Resume Next
+    Set bundlesSheet = wb.Sheets(TASK_BUNDLES_SHEET)
+    Set taskListSheet = wb.Sheets(TASK_LIST_SHEET)
+    On Error GoTo 0
+    If bundlesSheet Is Nothing Or taskListSheet Is Nothing Then
+        MsgBox "Couldn't find the """ & TASK_BUNDLES_SHEET & """ or """ & TASK_LIST_SHEET & """ tab.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim bundleCols As Object, taskListCols As Object
+    Set bundleCols = GetColumnMap(bundlesSheet, OTHER_SHEETS_HEADER_ROW)
+    Set taskListCols = GetColumnMap(taskListSheet, TASK_LIST_HEADER_ROW)
+    If Not RequireColumns(bundleCols, Array(COL_BUNDLE_PROJECT), TASK_BUNDLES_SHEET, OTHER_SHEETS_HEADER_ROW) Then Exit Sub
+    If Not RequireColumns(taskListCols, Array(COL_TASK_ADDED), TASK_LIST_SHEET, TASK_LIST_HEADER_ROW) Then Exit Sub
+
+    Dim sharedFields As Collection: Set sharedFields = New Collection
+    Dim key As Variant
+    For Each key In taskListCols.Keys
+        If bundleCols.Exists(key) Then sharedFields.Add key
+    Next key
+    If sharedFields.Count = 0 Then
+        MsgBox "Couldn't find any matching column headers between """ & TASK_BUNDLES_SHEET & """ and """ & TASK_LIST_SHEET & """.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim projectCol As Long: projectCol = GetCol(bundleCols, COL_BUNDLE_PROJECT)
+    Dim lastRow As Long: lastRow = LastDataRow(bundlesSheet, OTHER_SHEETS_HEADER_ROW)
+    If lastRow <= OTHER_SHEETS_HEADER_ROW Then
+        MsgBox "No tasks found with a """ & COL_BUNDLE_PROJECT & """ of """ & projectName & """ on """ & TASK_BUNDLES_SHEET & """.", vbExclamation
+        Exit Sub
+    End If
+
+    Dim daysToCompleteCol As Long: daysToCompleteCol = GetCol(bundleCols, COL_DAYS_TO_COMPLETE)
+    Dim taskAddedCol As Long: taskAddedCol = GetCol(taskListCols, COL_TASK_ADDED)
+    Dim deadlineColOnTaskList As Long: deadlineColOnTaskList = GetCol(taskListCols, COL_DEADLINE)
+    Dim linkColOnBundles As Long: linkColOnBundles = GetCol(bundleCols, COL_LINK)
+    Dim linkColOnTaskList As Long: linkColOnTaskList = GetCol(taskListCols, COL_LINK)
+    Dim today As Date: today = TodayDateOnly()
+    Dim nowFormatted As Date: nowFormatted = Now
+    Dim normalizedProject As String: normalizedProject = NormalizeHeader(projectName)
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    On Error GoTo BundleCleanup
+
+    Dim addedCount As Long: addedCount = 0
+    Dim r As Long, rowProject As Variant
+    For r = OTHER_SHEETS_HEADER_ROW + 1 To lastRow
+        rowProject = bundlesSheet.Cells(r, projectCol).value
+        If rowProject <> "" Then
+            If NormalizeHeader(rowProject) = normalizedProject Then
+                Dim targetRow As Long: targetRow = TargetAppendRow(taskListSheet)
+                Dim f As Variant, fieldCol As Long
+                For Each f In sharedFields
+                    If f <> NormalizeHeader(COL_LINK) Then
+                        fieldCol = taskListCols.Item(f)
+                        taskListSheet.Cells(targetRow, fieldCol).value = bundlesSheet.Cells(r, bundleCols.Item(f)).value
+                    End If
+                Next f
+                If taskAddedCol > 0 Then taskListSheet.Cells(targetRow, taskAddedCol).value = nowFormatted
+                If daysToCompleteCol > 0 And deadlineColOnTaskList > 0 Then
+                    Dim daysToComplete As Variant: daysToComplete = bundlesSheet.Cells(r, daysToCompleteCol).value
+                    If daysToComplete <> "" Then
+                        If IsNumeric(daysToComplete) Then
+                            taskListSheet.Cells(targetRow, deadlineColOnTaskList).value = today + (CLng(daysToComplete) - 1)
+                        End If
+                    End If
+                End If
+                If linkColOnBundles > 0 And linkColOnTaskList > 0 Then
+                    ' See the matching comment in RunRecurringEngine - xlPasteAllExceptBorders
+                    ' keeps the hyperlink but not Task Bundles' table-style border color.
+                    bundlesSheet.Cells(r, linkColOnBundles).Copy
+                    taskListSheet.Cells(targetRow, linkColOnTaskList).PasteSpecial Paste:=xlPasteAllExceptBorders
+                    Application.CutCopyMode = False
+                End If
+                addedCount = addedCount + 1
+            End If
+        End If
+    Next r
+
+BundleCleanup:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+
+    If Err.Number <> 0 Then
+        MsgBox "Something went wrong adding the task bundle: " & Err.Description, vbExclamation
+        Exit Sub
+    End If
+
+    If addedCount = 0 Then
+        MsgBox "No tasks found with a """ & COL_BUNDLE_PROJECT & """ of """ & projectName & """ on """ & TASK_BUNDLES_SHEET & """.", vbExclamation
+        Exit Sub
+    End If
+
+    SortTaskListByDeadlineThenPriority
+    MsgBox "Added " & addedCount & " task(s) from """ & projectName & """.", vbInformation, "Task Bundle"
+End Sub
+
