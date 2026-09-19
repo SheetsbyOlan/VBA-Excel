@@ -1,0 +1,53 @@
+//Task List ------------------------------
+
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modTaskTracker.HandleActionableEdit Me, Target
+End Sub
+
+
+//Done Tab ------------------------------
+
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modTaskTracker.ClearValidationIfColumnInsert Me, Target, OTHER_SHEETS_HEADER_ROW
+End Sub
+
+
+//Parked Tab ------------------------------
+
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modTaskTracker.HandleActionableEdit Me, Target
+End Sub
+
+
+//Recurring Tab ------------------------------
+
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modTaskTracker.HandleRecurringRuleEdit Me, Target
+End Sub
+
+
+//Task Bundles ------------------------------
+
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    modTaskTracker.ClearValidationIfColumnInsert Me, Target, OTHER_SHEETS_HEADER_ROW
+End Sub
+
+
+
+//ThisWorkbook ------------------------------
+
+Option Explicit
+
+Private Sub Workbook_Open()
+    modTaskTracker.OnWorkbookOpen
+End Sub
