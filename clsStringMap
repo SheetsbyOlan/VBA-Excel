@@ -1,0 +1,48 @@
+Option Explicit
+
+Private mValues As Collection
+Private mKeys As Collection
+
+Private Sub Class_Initialize()
+    Set mValues = New Collection
+    Set mKeys = New Collection
+End Sub
+
+Public Sub Add(ByVal key As String, ByVal value As Variant)
+    If Exists(key) Then Exit Sub
+    mValues.Add value, key
+    mKeys.Add key
+End Sub
+
+Public Function Exists(ByVal key As String) As Boolean
+    Dim v As Variant
+    On Error Resume Next
+    v = mValues(key)
+    Exists = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Public Function Item(ByVal key As String) As Variant
+    Item = mValues(key)
+End Function
+
+Public Function Keys() As Variant
+    Dim n As Long: n = mKeys.Count
+    If n = 0 Then
+        Keys = Array()
+        Exit Function
+    End If
+    Dim arr() As Variant
+    ReDim arr(0 To n - 1)
+    Dim i As Long
+    For i = 1 To n
+        arr(i - 1) = mKeys(i)
+    Next i
+    Keys = arr
+End Function
+
+Public Function Count() As Long
+    Count = mValues.Count
+End Function
+
