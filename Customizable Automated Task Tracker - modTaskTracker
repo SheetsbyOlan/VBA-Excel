@@ -89,7 +89,8 @@ Public Sub ShowStatus(ByVal message As String)
     On Error GoTo 0
 End Sub
 
-' Resets the status bar. Must stay Public with no arguments - Application.OnTime calls it by name.
+' Resets the status bar. Leave this named exactly as-is - it's scheduled automatically a few
+' seconds after ShowStatus runs, and renaming it would break that.
 Public Sub ClearStatus()
     Application.StatusBar = False
 End Sub
@@ -103,8 +104,8 @@ Public Function HeaderRowFor(ByVal sheetName As String) As Long
     End If
 End Function
 
-' Where a given Progress value routes the row to - keyed by normalized text so a customer
-' typing "done" or "Done " still matches, same as header matching does elsewhere.
+' Where a given Progress value routes the row to - keyed by normalized text so typing "done"
+' or "Done " still matches, same as header matching does elsewhere.
 Public Function GetStatusRoute(ByVal value As Variant) As String
     Select Case NormalizeHeader(value)
         Case NormalizeHeader(STATUS_DONE): GetStatusRoute = DONE_SHEET
@@ -123,10 +124,8 @@ Public Function NormalizeHeader(ByVal text As Variant) As String
     NormalizeHeader = LCase$(Trim$(CStr(text)))
 End Function
 
-' Last column with real content in a given row. Uses UsedRange bounds rather than
-' End(xlToLeft)/End(xlToRight) - those mirror Ctrl+Left/Right and skip clean over a hidden or
-' collapsed column as if it weren't there, so a sheet's true last header could go missing from
-' every lookup just because a customer hid or grouped a column.
+' Last column with real content in a given row. Works correctly even if you've hidden or
+' grouped columns, so a hidden column's header is never skipped.
 Public Function LastColInRow(ByVal ws As Worksheet, ByVal rowNum As Long) As Long
     Dim rightBound As Long
     rightBound = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
@@ -214,7 +213,7 @@ Public Function TargetAppendRow(ByVal ws As Worksheet) As Long
         lastRow = ws.Cells(ws.Rows.Count, taskNameCol).End(xlUp).row
         If lastRow < headerRow Then lastRow = headerRow
     Else
-        lastRow = LastDataRow(ws, headerRow) ' fallback - shouldn't happen, Task List is required
+        lastRow = LastDataRow(ws, headerRow)
     End If
     TargetAppendRow = lastRow + 1
 End Function
@@ -231,8 +230,9 @@ End Function
 
 '====================== TAB SYNC ======================
 ' Parked and Done receive whole rows copied straight from Task List, so their columns need to
-' match Task List's exactly. This keeps them in sync automatically - add, rename, or reorder a
-' column on Task List and it propagates to both.
+' match Task List's exactly. This keeps them in sync automatically - add or reorder a column on
+' Task List and it propagates to both. Renaming an existing column works differently - see
+' SyncSheetColumnsTo below.
 
 Private Function MirrorSheetNames() As Variant
     MirrorSheetNames = Array(PARKED_SHEET, DONE_SHEET)
@@ -302,10 +302,8 @@ Private Sub SyncSheetColumnsTo(ByVal targetSheet As Worksheet, sourceHeaders() A
     Dim i As Long
     Dim expected As String
 
-    ' The rightmost column any correctly-placed header has reached so far. Comparing against
-    ' this (rather than each header's raw position in sourceHeaders) means a gap left by a
-    ' deleted Task List column is simply ignored, instead of triggering pointless moves that
-    ' would shove an unrelated column out of place.
+    ' Tracks the rightmost column placed so far, so a column deleted earlier from Task List
+    ' doesn't cause every column after it to shift position unnecessarily.
     Dim lastPlacedCol As Long: lastPlacedCol = 0
 
     For i = LBound(sourceHeaders) To UBound(sourceHeaders)
@@ -327,8 +325,6 @@ Private Sub SyncSheetColumnsTo(ByVal targetSheet As Worksheet, sourceHeaders() A
             Else
                 Dim insertCol As Long: insertCol = lastPlacedCol + 1
                 targetSheet.Columns(insertCol).Insert Shift:=xlToRight
-                ' Runs with EnableEvents off, so the usual edit-triggered validation cleanup
-                ' never fires for it - do it directly instead.
                 ClearInheritedValidationOnNewColumns targetSheet, insertCol, insertCol, headerRow
                 targetSheet.Cells(headerRow, insertCol).value = sourceHeaders(i)
                 lastPlacedCol = insertCol
@@ -466,7 +462,7 @@ End Function
 ' month's actual last day whenever dayOfMonth exceeds it (e.g. "31" in February -> Feb 28/29).
 Public Function NextDayOfMonthOnOrAfter(ByVal notBefore As Date, ByVal dayOfMonth As Long) As Date
     Dim i As Long, baseDate As Date, lastDayInMonth As Long, useDay As Long, candidate As Date
-    For i = 0 To 12 ' safety bound - real answer always resolves within 1-2 months
+    For i = 0 To 12
         baseDate = DateSerial(Year(notBefore), Month(notBefore) + i, 1)
         lastDayInMonth = day(DateSerial(Year(baseDate), Month(baseDate) + 1, 0))
         If dayOfMonth < lastDayInMonth Then useDay = dayOfMonth Else useDay = lastDayInMonth
@@ -548,7 +544,7 @@ Private Function NthBusinessDayInRange(ByVal startD As Date, ByVal endD As Date,
 End Function
 
 Private Function GetWeekBounds(ByVal refDate As Date) As Variant
-    ' Week starts Sunday, matching Weekday()'s 1=Sunday convention used throughout.
+    ' Weeks run Sunday through Saturday for this calculation.
     Dim d As Date: d = refDate - (Weekday(refDate) - 1)
     GetWeekBounds = Array(d, d + 6)
 End Function
@@ -616,7 +612,7 @@ Public Function ComputeNextOccurrence(ByVal position As Variant, ByVal dayName A
         End Select
 
         Dim wi As Long, wCandidate As Date
-        For wi = 1 To 5 ' safety bound - real answer always resolves within 1-2 iterations
+        For wi = 1 To 5
             wCandidate = NthBusinessDayInRange(wBounds(0), wBounds(1), position)
             If wCandidate <> 0 Then
                 If wCandidate >= notBefore Then
@@ -658,7 +654,7 @@ Public Function ComputeNextOccurrence(ByVal position As Variant, ByVal dayName A
     End Select
 
     Dim i As Long, candidate As Date
-    For i = 1 To 5 ' safety bound - real answer always resolves within 1-2 iterations
+    For i = 1 To 5
         candidate = NthWeekdayInRange(bounds(0), bounds(1), position, dayIndex)
         If candidate <> 0 Then
             If candidate >= notBefore Then
@@ -675,14 +671,28 @@ Public Function ComputeNextOccurrence(ByVal position As Variant, ByVal dayName A
     ComputeNextOccurrence = 0
 End Function
 
-' Earliest date a "next occurrence" search should consider: the day after Last Added, or today
-' if the rule has never fired.
-Public Function ComputeFloorDate(ByVal lastAdded As Variant) As Date
+' Earliest date a "next occurrence" search should consider: the day after Last Added, or - if
+' the rule has never fired - the start of whichever Week/Month/Quarter/Year contains today. That
+' way a brand new rule still catches its very first occurrence even if nobody opens the file (or
+' clicks "Add Recurring Tasks Now") until a few days after that occurrence's date has passed.
+Public Function ComputeFloorDate(ByVal lastAdded As Variant, Optional ByVal period As Variant = "") As Date
     If IsDate(lastAdded) Then
         ComputeFloorDate = DateOnly(CDate(lastAdded)) + 1
-    Else
-        ComputeFloorDate = TodayDateOnly()
+        Exit Function
     End If
+
+    Dim today As Date: today = TodayDateOnly()
+    Dim bounds As Variant
+    Select Case CanonicalPeriod(period)
+        Case PERIOD_WEEK: bounds = GetWeekBounds(today)
+        Case PERIOD_MONTH: bounds = GetMonthBounds(today)
+        Case PERIOD_QUARTER: bounds = GetQuarterBounds(today)
+        Case PERIOD_YEAR: bounds = GetYearBounds(today)
+        Case Else
+            ComputeFloorDate = today
+            Exit Function
+    End Select
+    ComputeFloorDate = CDate(bounds(0))
 End Function
 
 '====================== LIVE NEXT ADD (Recurring sheet edit) ======================
@@ -765,7 +775,7 @@ Private Sub RefreshNextAddForRow(ByVal sh As Worksheet, ByVal row As Long, ByVal
     Dim lastAdded As Variant
     If lastAddedCol > 0 Then lastAdded = sh.Cells(row, lastAddedCol).value Else lastAdded = ""
     Dim nextDate As Date
-    nextDate = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded))
+    nextDate = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded, period))
     If nextDate <> 0 Then
         sh.Cells(row, nextAddCol).value = nextDate
     Else
@@ -861,7 +871,7 @@ Public Function RunRecurringEngine() As String
     Dim lastRow As Long: lastRow = LastDataRow(recurringSheet, OTHER_SHEETS_HEADER_ROW)
     Dim numDataRows As Long: numDataRows = lastRow - OTHER_SHEETS_HEADER_ROW
     If numDataRows <= 0 Then
-        RunRecurringEngine = ""
+        RunRecurringEngine = "No additional recurring tasks are due."
         Exit Function
     End If
 
@@ -911,7 +921,7 @@ Public Function RunRecurringEngine() As String
                 Dim needsPosition As Boolean
                 needsPosition = RuleNeedsPosition(period, day)
                 If Not ((needsPosition And position = "") Or day = "") Then
-                    nextOccurrence = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded))
+                    nextOccurrence = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded, period))
                     If nextOccurrence <> 0 Then due = (nextOccurrence <= today)
                 End If
             End If
@@ -920,8 +930,8 @@ Public Function RunRecurringEngine() As String
                 Dim targetRow As Long
                 targetRow = TargetAppendRow(taskListSheet)
 
-                ' Link and Deadline are handled separately below - Link needs a real Copy to
-                ' preserve the hyperlink, and Deadline needs the offset-to-date math further down.
+                ' Link keeps its hyperlink via a real Copy below; Deadline is computed from the
+                ' offset further down.
                 Dim f As Variant, fieldCol As Long
                 For Each f In sharedFields
                     If f <> NormalizeHeader(COL_LINK) And f <> NormalizeHeader(COL_DEADLINE) Then
@@ -930,8 +940,8 @@ Public Function RunRecurringEngine() As String
                     End If
                 Next f
                 If linkColOnRecurring > 0 And linkColOnTaskList > 0 Then
-                    ' xlPasteAllExceptBorders keeps the hyperlink but leaves Task List's own
-                    ' border formatting alone, instead of also copying Recurring's borders.
+                    ' Copies the hyperlink without carrying over Recurring's border formatting
+                    ' onto Task List.
                     recurringSheet.Cells(row, linkColOnRecurring).Copy
                     taskListSheet.Cells(targetRow, linkColOnTaskList).PasteSpecial Paste:=xlPasteAllExceptBorders
                     Application.CutCopyMode = False
@@ -986,7 +996,7 @@ EngineCleanup:
         SortTaskListByDeadlineThenPriority
         RunRecurringEngine = "Added " & addedCount & " recurring task(s) and re-sorted Task List."
     Else
-        RunRecurringEngine = ""
+        RunRecurringEngine = "No additional recurring tasks are due."
     End If
 End Function
 
@@ -1015,7 +1025,7 @@ Public Sub HandleActionableEdit(ByVal sh As Worksheet, ByVal Target As Range)
     Dim sheetName As String: sheetName = sh.name
     Dim headerRow As Long: headerRow = HeaderRowFor(sheetName)
 
-    ' Auto-propagate a new/renamed header on Task List to every mirror tab (Parked, Done).
+    ' Trigger column sync whenever a Task List header is added or changed.
     If sheetName = TASK_LIST_SHEET Then
         Dim editedStartRow As Long, editedEndRow As Long
         editedStartRow = Target.row
@@ -1075,16 +1085,12 @@ Public Sub HandleActionableEdit(ByVal sh As Worksheet, ByVal Target As Range)
         End If
     Next i
 
-    ' Final sweep: catches any row whose Progress value still has a route but didn't get moved
-    ' above - a fill-drag fires a separate event per row, and an earlier row's move can shift a
-    ' later row before its own event runs, making the row number it captured stale. Re-reads the
-    ' sheet fresh and finishes the job.
+    ' Final sweep: catches any row that still needs to move but didn't above - a fill-drag can
+    ' shift row numbers partway through, so this re-reads the sheet fresh and finishes the job.
     If touchesProgress Then
         If IsPartOfProgressEditBurst(numRows) Then
             Dim sweepLastRow As Long: sweepLastRow = LastDataRow(sh, headerRow)
             If sweepLastRow > headerRow Then
-                ' Bulk-read the Progress column once rather than one .Value per row, so a
-                ' bloated used range can't make this slow.
                 Dim sweepRowCount As Long: sweepRowCount = sweepLastRow - headerRow
                 Dim sweepVals As Variant
                 If sweepRowCount = 1 Then
@@ -1131,8 +1137,8 @@ Private Sub HandleProgressChange(ByVal sh As Worksheet, ByVal row As Long, ByVal
     Dim progressCol As Long: progressCol = GetCol(cols, COL_PROGRESS)
 
     ' Re-check the live value first - a fill-drag can shift row numbers between when this was
-    ' queued and when it runs, so `row` may no longer hold what triggered this call. The sweep
-    ' in HandleActionableEdit picks up anything skipped here.
+    ' queued and when it runs, so this row may no longer hold what triggered the call. The sweep
+    ' above picks up anything skipped here.
     Dim currentValue As Variant
     currentValue = sh.Cells(row, progressCol).value
     If NormalizeHeader(currentValue) <> normalizedValue Then Exit Sub
@@ -1172,6 +1178,9 @@ Private Sub HandleProgressChange(ByVal sh As Worksheet, ByVal row As Long, ByVal
         StripDeadlineFormattingOnDone targetSheet
         StampWeeklyStartDateOnDone targetSheet, targetRow
         StampMetDeadlineFormula targetSheet, targetRow
+        ' Pivot tables and charts update when you open Visualizations, not here - see
+        ' RefreshReports. That way, finishing several tasks in a row only refreshes your
+        ' dashboard once, the next time you actually look at it.
     End If
 
     ' A row landing on Task List (e.g. "Ready" from Parked) always lands appended at the bottom,
@@ -1181,6 +1190,14 @@ Private Sub HandleProgressChange(ByVal sh As Worksheet, ByVal row As Long, ByVal
     End If
 
     ShowStatus "Moved to """ & targetSheetName & """"
+End Sub
+
+' Refreshes every pivot table, chart, and query in the workbook. Runs automatically each time you
+' open Visualizations, so your dashboard is always showing your latest data.
+Public Sub RefreshReports()
+    On Error Resume Next
+    ThisWorkbook.RefreshAll
+    On Error GoTo 0
 End Sub
 
 ' Removes the overdue-deadline red-highlight rule from Done's Deadline column.
@@ -1237,8 +1254,8 @@ Public Function FindLabeledCellRight(ByVal ws As Worksheet, ByVal labelText As S
     If Not found Is Nothing Then Set FindLabeledCellRight = found.Offset(0, 1)
 End Function
 
-' The day name below the "Beginning of Week" label, as a VBA Weekday() constant. Defaults to
-' Monday if that cell can't be found, is blank, or holds something unrecognized.
+' The day name below the "Beginning of Week" label. Defaults to Monday if that cell can't be
+' found, is blank, or holds something unrecognized.
 Private Function GetConfiguredWeekStartDay() As VbDayOfWeek
     Dim recurringSheet As Worksheet
     On Error Resume Next
@@ -1398,8 +1415,6 @@ Public Sub SortTaskListByDeadlineThenPriority()
     priorityCol = GetCol(cols, COL_PRIORITY)
     Dim priorityOrder As Variant: priorityOrder = GetPriorityOrder()
 
-    ' Read both columns in one call each rather than cell by cell - much faster, and immune to
-    ' a bloated used range slowing things down.
     Dim deadlineVals As Variant, priorityVals As Variant
     deadlineVals = ws.Range(ws.Cells(firstDataRow, deadlineCol), ws.Cells(lastRow, deadlineCol)).value
     priorityVals = ws.Range(ws.Cells(firstDataRow, priorityCol), ws.Cells(lastRow, priorityCol)).value
@@ -1591,8 +1606,8 @@ Public Sub AddTaskBundle(ByVal projectName As String)
                     End If
                 End If
                 If linkColOnBundles > 0 And linkColOnTaskList > 0 Then
-                    ' See the matching comment in RunRecurringEngine - xlPasteAllExceptBorders
-                    ' keeps the hyperlink but not Task Bundles' table-style border color.
+                    ' Copies the hyperlink without carrying over Task Bundles' border
+                    ' formatting onto Task List.
                     bundlesSheet.Cells(r, linkColOnBundles).Copy
                     taskListSheet.Cells(targetRow, linkColOnTaskList).PasteSpecial Paste:=xlPasteAllExceptBorders
                     Application.CutCopyMode = False
