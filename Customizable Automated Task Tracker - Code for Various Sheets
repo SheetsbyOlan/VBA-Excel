@@ -51,3 +51,20 @@ Option Explicit
 Private Sub Workbook_Open()
     modTaskTracker.OnWorkbookOpen
 End Sub
+
+-------------------------------------------------------------------------------------------------------------
+//Worksheet (If doing Visualizations upgrade tutorial) ------------------------------
+
+Private Sub Worksheet_Activate()
+    modTaskTracker.RefreshReports
+End Sub
+
+
+//Visualizations (If doing Visualizations upgrade tutorial) ------------------------------
+
+Private Sub Worksheet_Activate()
+    modTaskTracker.RefreshReports
+End Sub
+
+
+
