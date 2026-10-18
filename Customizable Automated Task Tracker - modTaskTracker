@@ -450,6 +450,32 @@ Public Function ParseDayOfMonth(ByVal dayName As Variant) As Long
     ParseDayOfMonth = -1
 End Function
 
+' A positive whole number typed into Day for an "Every N [Period]" rule - any size, not capped
+' at 31 like a day-of-month value, so "every 60 days" or "every 90 days" both work. -1 if the
+' cell isn't a positive whole number.
+Public Function ParsePositiveInteger(ByVal value As Variant) As Long
+    Dim normalized As String: normalized = Trim$(CStr(value))
+    If normalized <> "" Then
+        If IsNumeric(normalized) Then
+            Dim num As Double: num = CDbl(normalized)
+            If num = Int(num) And num >= 1 Then
+                ParsePositiveInteger = CLng(num)
+                Exit Function
+            End If
+        End If
+    End If
+    ParsePositiveInteger = -1
+End Function
+
+' True when Position is set to "Every" and Day holds a positive whole number - the combination
+' that means "every N [Period]" (e.g. Position=Every, Day=6, Period=Month = every 6 months)
+' instead of a calendar-pattern rule. If Position isn't "Every," or Day isn't a usable number
+' (still a weekday name, e.g.), this is False and the row is handled by the regular Position/
+' Day/Period rule below instead - exactly as if "Every" had never been entered.
+Public Function IsEveryRule(ByVal position As Variant, ByVal day As Variant) As Boolean
+    IsEveryRule = (NormalizeHeader(position) = "every") And (ParsePositiveInteger(day) > 0)
+End Function
+
 Public Function DateOnly(ByVal d As Date) As Date
     DateOnly = DateSerial(Year(d), Month(d), day(d))
 End Function
@@ -695,6 +721,36 @@ Public Function ComputeFloorDate(ByVal lastAdded As Variant, Optional ByVal peri
     ComputeFloorDate = CDate(bounds(0))
 End Function
 
+' Adds n months to d, landing on the target month's actual last day if d's day-of-month doesn't
+' exist there (e.g. Jan 31 + 1 month -> Feb 28, or Feb 29/29 on a leap year).
+Private Function AddMonthsClamped(ByVal d As Date, ByVal n As Long) As Date
+    Dim firstOfTarget As Date: firstOfTarget = DateSerial(Year(d), Month(d) + n, 1)
+    Dim lastDayOfTarget As Long: lastDayOfTarget = day(DateSerial(Year(firstOfTarget), Month(firstOfTarget) + 1, 0))
+    Dim targetDay As Long: targetDay = day(d)
+    If targetDay > lastDayOfTarget Then targetDay = lastDayOfTarget
+    AddMonthsClamped = DateSerial(Year(firstOfTarget), Month(firstOfTarget), targetDay)
+End Function
+
+' Next occurrence for an "Every N [Period]" rule: n units of Period after Last Added, or today
+' if this rule has never fired yet (nothing to count forward from, so it's due right away, same
+' as any other rule's very first run).
+Public Function ComputeNextOccurrenceEvery(ByVal n As Long, ByVal period As Variant, ByVal lastAdded As Variant) As Date
+    If Not IsDate(lastAdded) Then
+        ComputeNextOccurrenceEvery = TodayDateOnly()
+        Exit Function
+    End If
+
+    Dim baseDate As Date: baseDate = DateOnly(CDate(lastAdded))
+    Select Case CanonicalPeriod(period)
+        Case PERIOD_DAY: ComputeNextOccurrenceEvery = baseDate + n
+        Case PERIOD_WEEK: ComputeNextOccurrenceEvery = baseDate + (n * 7)
+        Case PERIOD_MONTH: ComputeNextOccurrenceEvery = AddMonthsClamped(baseDate, n)
+        Case PERIOD_QUARTER: ComputeNextOccurrenceEvery = AddMonthsClamped(baseDate, n * 3)
+        Case PERIOD_YEAR: ComputeNextOccurrenceEvery = AddMonthsClamped(baseDate, n * 12)
+        Case Else: ComputeNextOccurrenceEvery = 0
+    End Select
+End Function
+
 '====================== LIVE NEXT ADD (Recurring sheet edit) ======================
 ' Recomputes "Next Add Date" the moment a recurrence rule changes, so a wrong combination is
 ' obvious right away instead of days later when nothing fires. Called from Recurring's
@@ -752,19 +808,28 @@ Private Sub RefreshNextAddForRow(ByVal sh As Worksheet, ByVal row As Long, ByVal
         Exit Sub
     End If
 
+    Dim position As Variant, day As Variant
+    position = sh.Cells(row, positionCol).value
+    day = sh.Cells(row, dayCol).value
+    Dim lastAdded As Variant
+    If lastAddedCol > 0 Then lastAdded = sh.Cells(row, lastAddedCol).value Else lastAdded = ""
+
+    ' "Every N [Period]" overrides the regular Position/Day/Period rule below - checked first,
+    ' so a Day value typed as a number for this mode is never misread as a day-of-month or
+    ' similar by the regular rule.
+    If IsEveryRule(position, day) Then
+        sh.Cells(row, nextAddCol).value = ComputeNextOccurrenceEvery(ParsePositiveInteger(day), period, lastAdded)
+        Exit Sub
+    End If
+
     If CanonicalPeriod(period) = PERIOD_DAY Then
         ' Daily rules are just checked on file-open or via the manual button, so there's no
         ' fixed future time to name - the next real check is today if not already added today,
         ' else tomorrow.
-        Dim dailyLastAdded As Variant
-        If lastAddedCol > 0 Then dailyLastAdded = sh.Cells(row, lastAddedCol).value Else dailyLastAdded = ""
-        sh.Cells(row, nextAddCol).value = ComputeFloorDate(dailyLastAdded)
+        sh.Cells(row, nextAddCol).value = ComputeFloorDate(lastAdded)
         Exit Sub
     End If
 
-    Dim position As Variant, day As Variant
-    position = sh.Cells(row, positionCol).value
-    day = sh.Cells(row, dayCol).value
     Dim needsPosition As Boolean
     needsPosition = RuleNeedsPosition(period, day)
     If (needsPosition And position = "") Or day = "" Then
@@ -772,8 +837,6 @@ Private Sub RefreshNextAddForRow(ByVal sh As Worksheet, ByVal row As Long, ByVal
         Exit Sub
     End If
 
-    Dim lastAdded As Variant
-    If lastAddedCol > 0 Then lastAdded = sh.Cells(row, lastAddedCol).value Else lastAdded = ""
     Dim nextDate As Date
     nextDate = ComputeNextOccurrence(position, day, period, ComputeFloorDate(lastAdded, period))
     If nextDate <> 0 Then
@@ -907,17 +970,20 @@ Public Function RunRecurringEngine() As String
         period = recurringSheet.Cells(row, periodCol).value
         If period <> "" Then
             lastAdded = recurringSheet.Cells(row, lastAddedCol).value
+            position = recurringSheet.Cells(row, positionCol).value
+            day = recurringSheet.Cells(row, dayCol).value
             due = False
 
-            If CanonicalPeriod(period) = PERIOD_DAY Then
+            If IsEveryRule(position, day) Then
+                nextOccurrence = ComputeNextOccurrenceEvery(ParsePositiveInteger(day), period, lastAdded)
+                If nextOccurrence <> 0 Then due = (nextOccurrence <= today)
+            ElseIf CanonicalPeriod(period) = PERIOD_DAY Then
                 ' Daily means "add if not already added today," checked on file-open and via
                 ' the manual button.
                 Dim lastAddedIsToday As Boolean
                 lastAddedIsToday = IsDate(lastAdded) And (DateOnly(CDate(lastAdded)) = today)
                 due = Not lastAddedIsToday
             Else
-                position = recurringSheet.Cells(row, positionCol).value
-                day = recurringSheet.Cells(row, dayCol).value
                 Dim needsPosition As Boolean
                 needsPosition = RuleNeedsPosition(period, day)
                 If Not ((needsPosition And position = "") Or day = "") Then
@@ -964,7 +1030,9 @@ Public Function RunRecurringEngine() As String
                 addedCount = addedCount + 1
 
                 recurringSheet.Cells(row, lastAddedCol).value = today
-                If CanonicalPeriod(period) = PERIOD_DAY Then
+                If IsEveryRule(position, day) Then
+                    recurringSheet.Cells(row, nextAddCol).value = ComputeNextOccurrenceEvery(ParsePositiveInteger(day), period, today)
+                ElseIf CanonicalPeriod(period) = PERIOD_DAY Then
                     ' Last Added is now today, so the next check is tomorrow.
                     recurringSheet.Cells(row, nextAddCol).value = ComputeFloorDate(today)
                 Else
